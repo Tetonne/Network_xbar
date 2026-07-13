@@ -1,13 +1,6 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
-# script optimisé pour macOS xbar.app (Ruby 2.6+)
 # script pour macOS (Catalina... Sequoia) avec ruby 2.6 dans l'application xbar.app
-# debug : cd ~/Library/Application\ Support/xbar/plugins/
-# debug : ruby VPN-flag294.txt --debug
-# debug : ruby -cw VPN-flag294.txt
-# rm -rf "$(ruby -e "require 'tmpdir'; print File.join(Dir.tmpdir, 'xbar_vpn_check2')")"
-# script optimisé pour macOS xbar.app (Ruby 2.6+)
-
 
 require 'digest'
 require 'ipaddr'
@@ -21,69 +14,139 @@ require 'timeout'
 require 'tmpdir'
 require 'open3'
 require 'openssl'
-require 'openssl'
 require 'base64'
+require 'logger'
+require 'yaml'
+require 'time'
 
+# ==============================================================================
+# 0. CONFIGURATION EXTERNALISÉE (YAML)
+# ==============================================================================
+CONFIG_DATA = <<~YAML
+  app_version: "v3.1.6"
+  thread_timeout: 1.0
+  debug_errors: true
+  allowed_countries: ["NL", "CH", "PL", "RO", "US"]
+  deny_countries: ["FR"]
+  ping_hosts: ["1.1.1.1", "8.8.8.8"]
+  trusted_dns: 
+    - "1.1.1.1"
+    - "1.0.0.1"
+    - "8.8.8.8"
+    - "8.8.4.4"
+    - "9.9.9.9"
+    - "149.112.112.112"
+    - "127.0.0.1"
+    - "2606:4700:4700::1111"
+    - "2606:4700:4700::1001"
+    - "2001:4860:4860::8888"
+    - "2001:4860:4860::8844"
+    - "2620:fe::fe"
+    - "2620:fe::9"
+    - "::1"
+  known_safe_dns_asns: ["13335", "15169", "19281", "34939", "212772"]
+  known_proton_asn: ["212238", "51852"]
+  apple_relay_asns: ["6185", "714", "54114", "213426"]
+  vpn_provider_keywords:
+    proton: "ProtonVPN"
+    mullvad: "Mullvad"
+    nordvpn: "NordVPN"
+    surfshark: "Surfshark"
+    expressvpn: "ExpressVPN"
+    ivpn: "IVPN"
+    cyberghost: "CyberGhost"
+    pia: "Private Internet Access"
+    m247: "M247"
+    datacamp: "DataCamp"
+    leaseweb: "Leaseweb"
+    digitalocean: "DigitalOcean"
+    ovh: "OVH"
+    choopa: "Choopa"
+    vultr: "Vultr"
+    hetzner: "Hetzner"
+  dns_providers:
+    "1.1.1.1": "☁️ Cloudflare"
+    "1.0.0.1": "☁️ Cloudflare"
+    "2606:4700:4700::1111": "☁️ Cloudflare"
+    "2606:4700:4700::1001": "☁️ Cloudflare"
+    "8.8.8.8": "🟦 Google"
+    "8.8.4.4": "🟦 Google"
+    "2001:4860:4860::8888": "🟦 Google"
+    "2001:4860:4860::8844": "🟦 Google"
+    "9.9.9.9": "🌐 Quad9"
+    "149.112.112.112": "🌐 Quad9"
+    "2620:fe::fe": "🌐 Quad9"
+    "2620:fe::9": "🌐 Quad9"
+    "94.140.14.14": "🛡️ AdGuard"
+    "94.140.15.15": "🛡️ AdGuard"
+    "45.90.28.0": "🧬 NextDNS"
+    "45.90.30.0": "🧬 NextDNS"
+    "194.242.2.2": "🦈 Mullvad DNS"
+    "194.242.2.3": "🦈 Mullvad DNS"
+    "76.76.2.0": "🎛️ ControlD"
+    "76.76.10.0": "🎛️ ControlD"
+    "208.67.222.222": "🔓 OpenDNS"
+    "208.67.220.220": "🔓 OpenDNS"
+    "185.228.168.9": "🧼 CleanBrowsing"
+    "185.228.169.9": "🧼 CleanBrowsing"
+    "193.110.81.0": "🇪🇺 DNS0"
+    "185.253.5.0": "🇪🇺 DNS0"
+    "127.0.0.1": "🔐 DNSCrypt / Proxy Local"
+    "::1": "🔐 DNSCrypt / Proxy Local"
+  colors:
+    secure: "#006400"
+    warn: "#FF9500"
+    alert: "#FF3B30"
+YAML
 
-$runtime_ctx ||= { using_public_ip: false, fallback_used: false }
-$tor_state ||= { ts: Time.at(0), ips: {} }
-$cache_mutex ||= Mutex.new
+class AppConfig
+  def initialize
+    @config = YAML.safe_load(CONFIG_DATA)
+    @mutex = Mutex.new
+  end
 
-THREAD_TIMEOUT = 1.2
-DEBUG_ERRORS = true
+  def self.instance
+    @instance ||= Mutex.new.synchronize { @instance || new }
+  end
 
-def log_error(e, context = "")
-  warn "[ERROR] #{context}: #{e.class} - #{e.message}" if DEBUG_ERRORS
+  def get(key)
+    @mutex.synchronize { @config[key.to_s] }
+  end
 end
 
 # ==============================================================================
-# 1. CONFIGURATION & GLOBALES
+# 1. LOGS ET SÉCURITÉ DE BASE
 # ==============================================================================
-APP_VERSION = "v3.0.4"
 
-ALLOWED_COUNTRIES = %w[NL CH PL RO US].freeze
-DENY_COUNTRIES    = %w[FR].freeze
-PING_HOSTS        = %w[1.1.1.1 8.8.8.8].freeze
-TRUSTED_DNS       = %w[
-  1.1.1.1 1.0.0.1 8.8.8.8 8.8.4.4 9.9.9.9 149.112.112.112 127.0.0.1
-  2606:4700:4700::1111 2606:4700:4700::1001 2001:4860:4860::8888 2001:4860:4860::8844
-  2620:fe::fe 2620:fe::9 ::1
-].freeze
+class StructuredLogger
+  def initialize(log_file = STDOUT)
+    @logger = Logger.new(log_file)
+    @logger.formatter = ->(severity, datetime, _progname, msg) {
+      { timestamp: datetime.iso8601, severity: severity, message: msg }.to_json + "\n"
+    }
+    @mutex = Mutex.new
+  end
 
-KNOWN_SAFE_DNS_ASNS = %w[13335 15169 19281 34939 212772].freeze
+  def self.instance
+    @instance ||= Mutex.new.synchronize { @instance || new }
+  end
 
-VPN_PROVIDER_KEYWORDS = {
-  "proton"       => "ProtonVPN",
-  "mullvad"      => "Mullvad",
-  "nordvpn"      => "NordVPN",
-  "surfshark"    => "Surfshark",
-  "expressvpn"   => "ExpressVPN",
-  "ivpn"         => "IVPN",
-  "cyberghost"   => "CyberGhost",
-  "pia"          => "Private Internet Access",
-  "m247"         => "M247",
-  "datacamp"     => "DataCamp",
-  "leaseweb"     => "Leaseweb",
-  "digitalocean" => "DigitalOcean",
-  "ovh"          => "OVH",
-  "choopa"       => "Choopa",
-  "vultr"        => "Vultr",
-  "hetzner"      => "Hetzner"
-}.freeze
+  def debug(msg)
+    @mutex.synchronize { @logger.debug(msg) }
+  end
 
-KNOWN_PROTON_ASN = %w[212238 51852].freeze
-APPLE_RELAY_ASNS = %w[6185 714 54114 213426].freeze
+  def info(msg)
+    @mutex.synchronize { @logger.info(msg) }
+  end
 
-DNS_PROVIDERS = {
-  "1.1.1.1" => "☁️ Cloudflare", "1.0.0.1" => "☁️ Cloudflare",
-  "8.8.8.8" => "🟦 Google",     "8.8.4.4" => "🟦 Google",
-  "9.9.9.9" => "🌐 Quad9",      "149.112.112.112" => "🌐 Quad9",
-  "127.0.0.1" => "🔐 DNSCrypt"
-}.freeze
+  def warn(msg)
+    @mutex.synchronize { @logger.warn(msg) }
+  end
 
-COLOR_SECURE = "#006400"
-COLOR_WARN   = "#FF9500"
-COLOR_ALERT  = "#FF3B30"
+  def error(msg)
+    @mutex.synchronize { @logger.error(msg) }
+  end
+end
 
 DEBUG     = ARGV.include?("--debug")
 JSON_MODE = ARGV.include?("--json")
@@ -92,35 +155,102 @@ def debug(msg)
   warn "[DEBUG] #{msg}" if DEBUG
 end
 
-# ==============================================================================
-# 2. COUCHE RESILIENCE & CACHE
-# ==============================================================================
-def encryption_key
-  @encryption_key ||= Digest::SHA256.hexdigest(
-    `${'scutil --computer'}.chomp + ${'scutil --localHostName'}.chomp + ENV['USER']`
-  )[0..31] # 32 bytes pour AES-256
-end
+class SecurityManager
+  def initialize
+    @mutex = Mutex.new
+  end
 
-def encrypt_data(data, key = encryption_key)
-  cipher = OpenSSL::Cipher.new('aes-256-cbc')
+  def self.instance
+    @instance ||= Mutex.new.synchronize { @instance || new }
+  end
+
+  def encryption_key
+    @encryption_key ||= @mutex.synchronize do
+      computer = `scutil --get ComputerName`.chomp rescue "mac"
+      host     = `scutil --get LocalHostName`.chomp rescue "local"
+      user     = ENV['USER'] || 'default'
+      Digest::SHA256.digest("#{computer}#{host}#{user}")
+    end
+  end
+
+  def encrypt_data(data)
+  return nil if data.to_s.empty?
+  
+  cipher = OpenSSL::Cipher.new("aes-256-gcm")
   cipher.encrypt
-  cipher.key = Digest::SHA256.digest(key)
-  iv = cipher.random_iv
-  encrypted = cipher.update(data) + cipher.final
-  Base64.strict_encode64(iv + encrypted)
+  
+  # 1. On s'assure de l'affectation stricte de la clé secrète de 32 octets
+  cipher.key = encryption_key
+  
+  # 2. Configuration sécurisée de l'IV
+  iv = cipher.random_iv # Génère automatiquement l'IV avec la bonne longueur
+  cipher.iv = iv
+  
+  # 3. Chiffrement des données fondamentales
+  encrypted = cipher.update(data.to_s) + cipher.final
+  
+  # 4. Extraction obligatoire du tag d'authentification propre au mode GCM
+  tag = cipher.auth_tag
+  
+  payload = {
+    v: 1,
+    iv: Base64.strict_encode64(iv),
+    tag: Base64.strict_encode64(tag),
+    data: Base64.strict_encode64(encrypted)
+  }
+  Base64.strict_encode64(JSON.generate(payload))
+rescue StandardError => e
+  StructuredLogger.instance.error("encrypt_data failed: #{e.class} - #{e.message}")
+  nil
 end
 
+  def decrypt_data(encoded_data)
+    return nil if encoded_data.to_s.strip.empty?
+    payload = JSON.parse(Base64.strict_decode64(encoded_data)) rescue nil
+    return nil unless payload && payload["v"] == 1
+    
+    cipher = OpenSSL::Cipher.new("aes-256-gcm")
+    cipher.decrypt
+    cipher.key = encryption_key
+    cipher.iv = Base64.strict_decode64(payload["iv"])
+    cipher.auth_tag = Base64.strict_decode64(payload["tag"])
+    
+    encrypted = Base64.strict_decode64(payload["data"])
+    cipher.update(encrypted) + cipher.final
+  rescue StandardError => e
+    StructuredLogger.instance.error("decrypt_data failed: #{e.class} - #{e.message}")
+    nil
+  end
+end
+
+def log_secure(message)
+  return unless DEBUG
+  encrypted_msg = SecurityManager.instance.encrypt_data("[#{Time.now.strftime('%Y-%m-%dT%H:%M:%S%z')}] #{message}")
+  if encrypted_msg
+    warn "[SECURE-LOG] #{encrypted_msg}"
+  else
+    warn "[SECURE-LOG-FAIL] Chiffrement échoué"
+  end
+end
+
+# ==============================================================================
+# 2. CACHE COUCHE & GESTION THREAD-SAFE SINGLETONS
+# ==============================================================================
 
 class LRUCachePro
-  Entry = Struct.new(:value, :ts, :loading)
+  Entry = Struct.new(:value, :ts, :loading, keyword_init: true)
 
-  def initialize(max_size: 300, ttl_default: 30)
+  def initialize(max_size: 500, ttl_default: 30)
     @max_size = max_size
     @ttl_default = ttl_default
     @data = {}
     @order = []
     @mutex = Mutex.new
     @stats = { hit: 0, miss: 0, expired: 0, stampede_block: 0 }
+  end
+
+  def self.instance
+    @instance ||= Mutex.new.synchronize { @instance || new }
   end
 
   def fetch(key, ttl: nil)
@@ -140,22 +270,42 @@ class LRUCachePro
         return entry.value
       end
       @stats[:miss] += 1
-      @data[key] = Entry.new(nil, now, true)
+      @data[key] = Entry.new(value: nil, ts: now, loading: true)
     end
 
     value = yield
 
     @mutex.synchronize do
       evict_if_needed
-      @data[key] = Entry.new(value, now, false)
+      @data[key] = Entry.new(value: value, ts: now, loading: false)
       @order << key
     end
     value
   end
 
-  def stats; @stats; end
+  def fetch_geo_provider(url_str, timeout: 1.5)
+    uri = URI(url_str)
+    ResilienceEngine.instance.execute_with_backoff do
+      Net::HTTP.start(uri.host, uri.port,
+               use_ssl: true,
+               verify_mode: OpenSSL::SSL::VERIFY_PEER,
+               open_timeout: timeout,
+               read_timeout: timeout) do |http|
+        res = http.get(uri.request_uri)
+        return JSON.parse(res.body) if res.is_a?(Net::HTTPSuccess)
+      end
+    end
+  rescue StandardError => e
+    StructuredLogger.instance.error("fetch_geo_provider fail pour #{url_str}: #{e.message}")
+    nil
+  end
+
+  def stats
+    @mutex.synchronize { @stats.dup }
+  end
 
   private
+
   def touch(key)
     @order.delete(key)
     @order << key
@@ -181,22 +331,113 @@ class LRUCachePro
   end
 end
 
-$CACHE = LRUCachePro.new
+class StateManager
+  def initialize
+    @runtime_ctx = { using_public_ip: false, fallback_used: false }
+    @mutex = Mutex.new
+  end
 
-def memoized(key, ttl = 30)
-  stack = (Thread.current[:memo_stack] ||= [])
-  return yield if stack.include?(key)
-  stack << key
-  begin
-    $CACHE.fetch(key, ttl: ttl) { yield }
-  ensure
-    stack.delete_at(stack.rindex(key) || 0)
+  def self.instance
+    @instance ||= Mutex.new.synchronize { @instance || new }
+  end
+
+  def get_ctx(key)
+    @mutex.synchronize { @runtime_ctx[key] }
+  end
+
+  def set_ctx(key, val)
+    @mutex.synchronize { @runtime_ctx[key] = val }
+  end
+
+  def system_state
+    memoized("system_state", 5) do
+      ifconfig_out, _ = Open3.capture2("ifconfig")
+      scutil_out, _   = Open3.capture2("scutil", "--nwi")
+      route_out, _    = Open3.capture2("route", "-n", "get", "default")
+      {
+        ifconfig: ifconfig_out,
+        scutil: scutil_out,
+        route: route_out
+      }
+    end
+  end
+
+  def memoized(key, ttl = 30)
+    stack = (Thread.current[:memo_stack] ||= [])
+    return yield if stack.include?(key)
+    stack << key
+    begin
+      LRUCachePro.instance.fetch(key, ttl: ttl) { yield }
+    ensure
+      stack.delete_at(stack.rindex(key) || 0)
+    end
   end
 end
+
+def memoized(key, ttl = 30, &block)
+  StateManager.instance.memoized(key, ttl, &block)
+end
+
+class ResilienceEngine
+  def initialize
+    @circuit_breakers = {}
+    @mutex = Mutex.new
+  end
+
+  def self.instance
+    @instance ||= Mutex.new.synchronize { @instance || new }
+  end
+
+  def execute_with_backoff(max_retries = 2)
+    retries = 0
+    begin
+      yield
+    rescue StandardError => e
+      if retries < max_retries
+        sleep_time = 0.3 * (2**retries)
+        sleep(sleep_time)
+        retries += 1
+        retry
+      else
+        raise e
+      end
+    end
+  end
+
+  def execute_with_circuit_breaker(url, max_failures: 3, reset_after: 60)
+    key = Digest::SHA256.hexdigest(url)
+    @mutex.synchronize do
+      @circuit_breakers[key] ||= { failures: 0, last_failure: nil }
+    end
+
+    now = Time.now
+    if @circuit_breakers[key][:failures] >= max_failures && now - @circuit_breakers[key][:last_failure] < reset_after
+      debug("Circuit breaker open for #{url}")
+      return nil
+    end
+
+    execute_with_backoff do
+      result = yield
+      @mutex.synchronize { @circuit_breakers[key][:failures] = 0 }
+      result
+    end
+  rescue StandardError => e
+    @mutex.synchronize do
+      @circuit_breakers[key][:failures] += 1
+      @circuit_breakers[key][:last_failure] = now
+    end
+    raise e
+  end
+end
+
+# ==============================================================================
+# 3. UTILS RESEAU IP ET PROTECTIONS
+# ==============================================================================
 
 module IPGuard
   module_function
   MULTICAST_V4 = IPAddr.new('224.0.0.0/4')
+  MULTICAST_V6 = IPAddr.new('ff00::/8')
 
   def parse(ip)
     return nil if ip.nil?
@@ -218,12 +459,12 @@ module IPGuard
   def sanitize(ip)
     addr = parse(ip)
     return nil unless addr
-    return nil if addr.loopback? || addr.link_local? || ipv4_multicast?(addr)
+    return nil if addr.loopback? || addr.link_local? || multicast?(addr)
     ip
   end
 
-  def ipv4_multicast?(addr)
-    addr.ipv4? && MULTICAST_V4.include?(addr)
+  def multicast?(addr)
+    (addr.ipv4? && MULTICAST_V4.include?(addr)) || (addr.ipv6? && MULTICAST_V6.include?(addr))
   end
 
   def valid_format?(ip)
@@ -232,32 +473,20 @@ module IPGuard
 end
 
 module DiskCache
-  # Utilisation du dossier Caches de l'utilisateur au lieu du dossier temporaire global
-  CACHE_DIR = File.expand_path("~/Library/Caches/com.xbar.vpn_checker_v3")
+  CACHE_DIR = File.join(Dir.tmpdir, "xbar_vpn_check2").freeze
 
   class << self
     def setup
-      # Création du dossier s'il n'existe pas
-      unless Dir.exist?(CACHE_DIR)
-        FileUtils.mkdir_p(CACHE_DIR)
-      end
-      
-      # Application de permissions strictes (Propriétaire : Lecture/Écriture/Exécution)
-      File.chmod(0700, CACHE_DIR)
-      
-      # Nettoyage des vieux fichiers temporaires
-      Dir.glob(File.join(CACHE_DIR, "*.tmp.*")).each do |file|
-        if File.exist?(file) && (Time.now - File.mtime(file) > 7200)
-          File.unlink(file) rescue nil
-        end
-      end
+      FileUtils.mkdir_p(CACHE_DIR)
+      File.chmod(0700, CACHE_DIR) if File.directory?(CACHE_DIR)
     rescue StandardError => e
-      debug("Impossible de configurer le dossier de cache: #{e.message}")
+      StructuredLogger.instance.error("DiskCache.setup: #{e.message}")
     end
 
-    def safe_json_parse(str)
-      JSON.parse(str)
-    rescue JSON::ParserError, TypeError
+    def safe_json_parse(data)
+      return nil if data.nil? || data.empty?
+      JSON.parse(data)
+    rescue JSON::ParserError
       nil
     end
 
@@ -266,87 +495,274 @@ module DiskCache
       file_key = Digest::SHA256.hexdigest(key)
       cache_file = File.join(CACHE_DIR, "cache.#{file_key}.json")
 
-      # Lecture si le cache est valide
       if File.exist?(cache_file) && (Time.now - File.mtime(cache_file) < ttl)
-        cached_data = safe_json_parse(File.read(cache_file))
-        return cached_data["data"] if cached_data && cached_data.key?("data")
+        begin
+          encrypted = File.read(cache_file)
+          decrypted = SecurityManager.instance.decrypt_data(encrypted)
+          cached = safe_json_parse(decrypted)
+          return cached["data"] if cached&.key?("data")
+        rescue StandardError
+        end
       end
 
-      # Exécution du bloc si cache manquant ou expiré
       value = yield
-      
+
       begin
         if value
-          # Écriture des données
-          File.write(cache_file, JSON.generate({ "data" => value }))
-          # Verrouillage du fichier (Propriétaire : Lecture/Écriture uniquement)
-          File.chmod(0600, cache_file)
+          tmp = "#{cache_file}.tmp.#{$$}"
+          encrypted = SecurityManager.instance.encrypt_data(JSON.generate({ "data" => value }))
+          File.write(tmp, encrypted)
+          File.chmod(0600, tmp)
+          File.rename(tmp, cache_file)
         end
       rescue StandardError => e
-        debug("Échec de l'écriture sécurisée DiskCache: #{e.message}")
+        StructuredLogger.instance.error("DiskCache.write: #{e.message}")
       end
-      
       value
     end
   end
 end
 
 # ==============================================================================
-# 3. UTILS SYSTEME MAC & RESEAU DE BASE
+# 4. ÉVOLUTIONS DEMANDÉES (CLASSES TOTALEMENT ENCAPSULÉES)
 # ==============================================================================
-def fallback_local_ip
-  Socket.ip_address_list.find { |ai|
-    ai.ipv4? && !ai.ipv4_loopback? && !ai.ipv4_multicast? }&.ip_address || "127.0.0.1"
-rescue StandardError
-  "127.0.0.1"
-end
 
-def local_geo_fallback(ip)
-  {
-    "country_code" => "🔒",
-    "org" => "Réseau Local Inconnu",
-    "isp" => "Pas de réponse Géo",
-    "asn" => "AS0",
-    "asn_org" => "Local Session"
-  }
-end
+class ProcessSnapshot
+  def self.instance
+    @instance ||= Mutex.new.synchronize { @instance || new }
+  end
 
-def global_network_context
-  @global_ctx ||= memoized("global_net_ctx", 10) do
-    ip = fetch_ip
-    ip = IPGuard.sanitize(ip)
-    procs = process_snapshot_global
-    vpn_st = vpn_state(procs)
-    {
-      ip: ip,
-      geo: ip ? geo_with_ip_cache(ip) : local_geo_fallback(nil),
-      vpn_state: vpn_st,
-      dns: system_dns,
-      perf: measure_network_perf,
-      procs: procs
-    }
+  def get
+    @proc_cache ||= { ts: 0, value: Set.new }
+    now = Time.now.to_i
+    return @proc_cache[:value] if now - @proc_cache[:ts] < 5
+
+    stdout, status = Open3.capture2("ps", "-A", "-o", "comm=")
+    return Set.new unless status.success?
+    value = stdout.lines.map { |l| File.basename(l.strip).downcase }.to_set
+    @proc_cache = { ts: now, value: value }
+    value
+  rescue StandardError => e
+    StructuredLogger.instance.error("process_snapshot fail: #{e.message}")
+    Set.new
   end
 end
 
-def process_snapshot_global
-  @proc_cache ||= { ts: 0, value: Set.new }
-  now = Time.now.to_i
-  return @proc_cache[:value] if now - @proc_cache[:ts] < 5
+class IPFetcher
+  def self.instance
+    @instance ||= Mutex.new.synchronize { @instance || new }
+  end
 
-  stdout, status = Open3.capture2("ps", "-A", "-o", "comm=")
-  return Set.new unless status.success?
+  def fetch
+    StateManager.instance.memoized("public_ip", 300) do
+      urls = [
+        { url: "https://api64.ipify.org?format=text", ipv: :v4, timeout: 1.0 },
+        { url: "https://api.ipify.org?format=text", ipv: :v4, timeout: 1.0 },
+        { url: "https://checkip.amazonaws.com", ipv: :v4, timeout: 1.5 },
+        { url: "https://api6.ipify.org?format=text", ipv: :v6, timeout: 1.5 },
+        { url: "https://v6.ident.me", ipv: :v6, timeout: 2.0 }
+      ].uniq { |entry| entry[:url] }
 
-  value = stdout.lines.map { |l| File.basename(l.strip).downcase }.to_set
-  @proc_cache = { ts: now, value: value }
-  value
-rescue StandardError => e
-  debug("process_snapshot_global fail: #{e.message}")
-  Set.new
+      queue = Thread::Queue.new
+      threads = urls.map do |entry|
+        Thread.new do
+          uri = URI(entry[:url])
+          ResilienceEngine.instance.execute_with_circuit_breaker(entry[:url]) do
+            Net::HTTP.start(uri.host, uri.port,
+                           use_ssl: true,
+                           verify_mode: OpenSSL::SSL::VERIFY_PEER,
+                           open_timeout: entry[:timeout],
+                           read_timeout: entry[:timeout]) do |http|
+              res = http.get(uri.request_uri)
+              if res.is_a?(Net::HTTPSuccess)
+                ip = res.body.to_s.strip
+                sanitized = IPGuard.sanitize(ip)
+                next unless sanitized
+                addr = IPGuard.parse(sanitized)
+                next unless addr
+                queue.push({ ip: sanitized, version: addr.ipv4? ? :v4 : :v6 })
+              end
+            end
+          end
+        rescue StandardError => e
+          StructuredLogger.instance.error("HTTP request failed for #{entry[:url]}: #{e.class} - #{e.message}")
+        end
+      end
+
+      result = []
+      success_count = 0
+      begin
+        timeout_val = AppConfig.instance.get(:thread_timeout) || 1.0
+        Timeout.timeout(timeout_val) do
+          while (entry = queue.pop(true) rescue nil)
+            result << entry
+            result.uniq! { |e| e[:ip] }
+            success_count += 1
+          end
+        end
+      rescue Timeout::Error
+        StructuredLogger.instance.warn("Timeout expired for fetch_ip (#{success_count}/#{urls.size} succeeded)")
+      ensure
+        threads.each { |th| th.kill rescue nil }
+        threads.each { |th| th.join rescue nil }
+      end
+
+      ipv4 = result.find { |e| e[:version] == :v4 }&.dig(:ip)
+      final_ip = ipv4 || result.first&.dig(:ip) || last_known_good_ip
+      store_last_known_good_ip(final_ip) if final_ip && IPGuard.valid_format?(final_ip)
+      final_ip
+    end
+  end
+
+  def last_known_good_ip
+    DiskCache.setup
+    path = File.join(DiskCache::CACHE_DIR, "last_good_ip.json")
+    return nil unless File.exist?(path)
+    data = JSON.parse(File.read(path)) rescue nil
+    return nil unless data && data["ip"] && data["ts"]
+    return nil if Time.now.to_i - data["ts"] > 86_400
+    ip = data["ip"]
+    (IPGuard.valid_format?(ip) && IPGuard.sanitize(ip)) ? ip : nil
+  end
+
+  def store_last_known_good_ip(ip)
+    return unless ip.is_a?(String) && IPGuard.sanitize(ip)
+    DiskCache.setup
+    path = File.join(DiskCache::CACHE_DIR, "last_good_ip.json")
+    tmp  = "#{path}.tmp.#{$$}"
+    File.write(tmp, JSON.generate(ip: ip, ts: Time.now.to_i))
+    File.chmod(0600, tmp)
+    File.rename(tmp, path)
+  rescue StandardError => e
+    StructuredLogger.instance.error("store_last_known_good_ip: #{e.message}")
+  end
 end
+
+
+
+class GeoLookup
+  def self.instance
+    @instance ||= Mutex.new.synchronize { @instance || new }
+  end
+
+def local_geo_fallback
+  {
+    "country_code" => "🏳️",
+    "org" => "Réseau Local / Inconnu",
+    "isp" => "Inconnu",
+    "asn" => nil,
+    "asn_org" => "Inconnu"
+  }
+end
+
+
+def lookup(ip)
+  cleaned_ip = ip.to_s.strip
+  return local_geo_fallback unless IPGuard.sanitize(cleaned_ip)
+
+  StateManager.instance.memoized("geo_ram_cache_#{cleaned_ip}", 86_400) do
+    DiskCache.fetch("geo_v9_#{cleaned_ip}", ttl: 86_400) do
+      urls = [
+        { url: "https://ipwho.is/#{cleaned_ip}", parser: "ipwho", priority: 1 },
+        { url: "https://ip-api.com/json/#{cleaned_ip}?fields=status,countryCode,org,as,isp", parser: "ipapi", priority: 2 },
+        { url: "https://ipinfo.io/#{cleaned_ip}/json", parser: "ipinfo", priority: 3 }
+      ].sort_by { |entry| entry[:priority] }
+
+      final_result = nil
+      urls.each do |entry|
+        raw = LRUCachePro.instance.fetch_geo_provider(entry[:url])
+        result = normalize_geo(raw, entry[:parser])
+        if result
+          final_result = result
+          break
+        end
+      end
+      
+      final_result || local_geo_fallback
+    end
+  end
+end
+
+
+
+  private
+
+  def normalize_geo(data, provider)
+    return nil if data.nil? || data.empty?
+    case provider
+    when "ipinfo"
+      return nil if data["bogon"] == true
+      {
+        "country_code" => data["country"],
+        "org" => data["org"],
+        "isp" => data["org"],
+        "asn" => data["asn"] ? "AS#{data["asn"]}" : nil,
+        "asn_org" => data["org"]
+      }
+    when "ipwho"
+      return nil if data["success"] == false
+      conn = data["connection"] || {}
+      {
+        "country_code" => data["country_code"] || data["country"],
+        "org" => conn["org"],
+        "isp" => conn["isp"],
+        "asn" => conn["asn"] ? "AS#{conn["asn"]}" : nil,
+        "asn_org" => conn["org"]
+      }
+    when "ipapi"
+      return nil if data["status"] == "fail"
+      asn_num = data["as"] ? data["as"].split(" ").first : nil
+      {
+        "country_code" => data["countryCode"],
+        "org" => data["org"],
+        "isp" => data["isp"],
+        "asn" => asn_num,
+        "asn_org" => data["org"]
+      }
+    end
+  end
+end
+
+class ProxyDetector
+  def self.instance
+    @instance ||= Mutex.new.synchronize { @instance || new }
+  end
+
+  def detected?
+    return true if ENV['HTTP_PROXY'] || ENV['HTTPS_PROXY'] || ENV['SOCKS_PROXY']
+    stdout, status = Open3.capture2("networksetup", "-getwebproxy", "Wi-Fi")
+    status.success? && stdout.include?("Enabled: Yes")
+  rescue StandardError
+    false
+  end
+end
+
+# Rétrocompatibilité du module NetworkAnalyzer sans casser le reste du script
+module NetworkAnalyzer
+  module_function
+  def fetch_ip; IPFetcher.instance.fetch; end
+  def geo(ip); GeoLookup.instance.lookup(ip); end
+  def proxy_detected?; ProxyDetector.instance.detected?; end
+  
+  def split_tunneling?
+    stdout, status = Open3.capture2("netstat", "-rn")
+    return false unless status.success?
+    vpn_interfaces = %w[utun wg tailscale tun ipsec]
+    default_routes = stdout.lines.select { |l| l.start_with?("default") }
+    vpn_routes = stdout.lines.count { |l| vpn_interfaces.any? { |iface| l.include?(iface) } }
+    has_non_vpn_default = default_routes.any? { |line| !vpn_interfaces.any? { |iface| line.include?(iface) } }
+    has_non_vpn_default && vpn_routes > 0
+  rescue StandardError
+    false
+  end
+end
+
+# ==============================================================================
+# 5. DIAGNOSTICS ET OUTILS SCRIPT D'ORIGINE
+# ==============================================================================
 
 module NetTools
   TEST_HOSTS = [["1.1.1.1", 53], ["8.8.8.8", 53]].freeze
-
   module_function
   def internet?
     TEST_HOSTS.any? do |host, port|
@@ -364,892 +780,669 @@ unless NetTools.internet?
   exit 0
 end
 
-# ==============================================================================
-# 4. MOTEUR DE PROTOCOLE IP & VALIDATIONS
-# ==============================================================================
 def flag(country)
   return "🏳️" unless country.is_a?(String) && country.match?(/\A[A-Z]{2}\z/)
-  memoized("flag_#{country}", 86400) do
+  StateManager.instance.memoized("flag_#{country}", 86400) do
     country.upcase.chars.map { |c| (0x1F1E6 + c.ord - 65).chr(Encoding::UTF_8) }.join
   end
 rescue StandardError
   "🏳️"
 end
 
-# ==============================================================================
-# 5. DETECTEURS RESEAU (IP, Geo, ASN, Apple Relay, Tor)
-# ==============================================================================
 
-module VPNChecker
-  class Error < StandardError; end
-  class NetworkError < Error; end
-  class CacheError < Error; end
+module DNSAnalyzer
+  module_function
 
-  def self.handle_error(e, context: "")
-    case e
-    when NetworkError then debug("[NETWORK] #{context}: #{e.message}")
-    when CacheError then debug("[CACHE] #{context}: #{e.message}")
-    else debug("[UNKNOWN] #{context}: #{e.class} - #{e.message}")
-    end
+  def collect
+    stdout, status = Open3.capture2("scutil", "--dns")
+    return collect_fallback unless status.success?
+    dns_list = stdout.scan(/nameserver\[\d+\]\s*:\s*([0-9a-fA-F:\.]+)/i).flatten.uniq.select { |ip| IPGuard.valid_format?(ip) }
+    dns_list.empty? ? collect_fallback : dns_list
+  rescue StandardError
+    []
   end
-end
 
-def last_known_good_ip
-  path = File.join(DiskCache::CACHE_DIR, "last_good_ip.json")
-  return nil unless File.exist?(path)
-
-  data = JSON.parse(File.read(path)) rescue nil
-  return nil unless data && data["ip"] && data["ts"]
-
-  # Vérifie que le cache a moins de 24h
-  return nil if Time.now.to_i - data["ts"] > 86_400
-
-  ip = data["ip"]
-  IPGuard.sanitize(ip) ? ip : nil
-end
-
-def store_last_known_good_ip(ip)
-  return unless ip.is_a?(String) && IPGuard.sanitize(ip)
-  path = File.join(DiskCache::CACHE_DIR, "last_good_ip.json")
-  DiskCache.setup
-  File.write(path, JSON.generate({ ip: ip, ts: Time.now.to_i }))
-rescue StandardError
-  nil
-end
-
-def with_retry(max_retries: 3, base_delay: 0.5, &block)
-  retries = 0
-  begin
-    block.call
-  rescue StandardError => e
-    retries += 1
-    if retries <= max_retries
-      sleep(base_delay * (2 ** (retries - 1))) # Backoff exponentiel
-      retry
-    end
-    raise
+  def collect_fallback
+    stdout, _ = Open3.capture2("networksetup", "-getdnsservers", "Wi-Fi")
+    stdout.lines.map(&:strip).select { |ip| IPGuard.valid_format?(ip) }
+  rescue StandardError
+    []
   end
-end
 
+  def normalize(dns_list, vpn_active)
+    local, vpn, public_dns = [], [], []
+    dns_list.each do |ip|
+      next unless IPGuard.valid_format?(ip)
+      if IPGuard.localhost?(ip)
+        local << ip
+      elsif IPGuard.private_ip?(ip)
+        vpn_active ? vpn << ip : local << ip
+      else
+        public_dns << ip
+      end
+    end
+    { local: local.uniq, vpn: vpn.uniq, public: public_dns.uniq }
+  end
 
+  def health(public_dns, vpn_dns, vpn_active, _current_ip_geo = nil)
+    public_dns ||= []
+    vpn_dns ||= []
+    all_dns = public_dns + vpn_dns
+    all_dns += collect.select { |ip| ip.include?(":") }
+    
+    doh_active = doh_detect
+    dot_active = dot_detect
+    encryption_active = vpn_dns.any? || public_dns.include?("127.0.0.1") || public_dns.include?("::1") || doh_active || dot_active
+    
+    leak = false
+    leak_reasons = []
 
-def fetch_ip
-  memoized("public_ip", 300) do
-    urls = %w[
-      https://api64.ipify.org?format=text
-      https://checkip.amazonaws.com
-      https://api.ipify.org?format=text
-    ].uniq
+    if vpn_active
+      scutil_out, _ = Open3.capture2("scutil", "--dns")
+      dns_interfaces = scutil_out.scan(/nameserver\[\d+\]\s*:\s*([0-9a-fA-F:\.]+)\s*\(([^)]+)\)/).map { |_, ip, iface| [ip, iface] }
 
-    threads = urls.map do |url|
-      Thread.new do
-        uri = URI(url)
-        Net::HTTP.start(uri.host, uri.port,
-                       use_ssl: true,
-                       open_timeout: 1.2,
-                       read_timeout: 1.2) do |http|
-          res = http.get(uri.request_uri)
-          res.is_a?(Net::HTTPSuccess) ? IPGuard.sanitize(res.body.to_s.strip) : nil
+      trusted = AppConfig.instance.get(:trusted_dns) || []
+      dns_interfaces.each do |dns_ip, iface|
+        next if trusted.include?(dns_ip)
+        next if iface.include?("utun") || iface.include?("wg") || iface.include?("tun") || iface.include?("tailscale")
+        if iface.include?("en") || iface.include?("Wi-Fi")
+          leak = true
+          leak_reasons << { dns: dns_ip, interface: iface, type: "DNS Query Bypassing VPN Tunnel" }
         end
-      rescue StandardError
-        nil
       end
     end
 
-    # Attend le premier résultat valide
-    ip = nil
-    threads.each do |t|
-      result = t.value
-      if result
-        ip = result
-        threads.each(&:kill) # Arrête les autres threads
+    status = if leak
+               :dns_leak
+             elsif encryption_active
+               :dns_secure
+             else
+               :dns_uncertain
+             end
+    { leak: leak, ipv6_leak: false, encryption: encryption_active, isolation: vpn_active ? !leak : encryption_active, status: status, leak_reasons: leak_reasons }
+  end
+
+  def consistency(vpn_detected, local, vpn, public_dns)
+    return "🟢 Cohérent (Réseau Standard)" unless vpn_detected
+    has_vpn_dns = vpn.any?
+    has_pub_dns = public_dns.any?
+    case
+    when has_vpn_dns && !has_pub_dns
+      "🔐 Sécurisé (Tunnel DNS Exclusif)"
+    when has_vpn_dns && has_pub_dns
+      "🟡 Mixte (Tunnel + Résolveurs Publics)"
+    when has_pub_dns
+      "⚠️ Danger (Fuite DNS probable)"
+    else
+      "🟢 Sécurisé (DNS Local/Inconnu)"
+    end
+  end
+
+  def detect_encryption_type(dns_split, doh_active)
+    dns_split ||= { public: [], vpn: [], local: [] }
+    public_dns = dns_split[:public] || []
+    vpn_dns = dns_split[:vpn] || []
+    if doh_active
+      "🔏 DNS-over-HTTPS (DoH)"
+    elsif dot_detect
+      "🔒 DNS-over-TLS (DoT)"
+    elsif public_dns.include?("127.0.0.1") || public_dns.include?("::1")
+      "🔐 Profil macOS Natif ou Local (DoT/DoH/DNSCrypt)"
+    elsif !vpn_dns.empty?
+      "🛡️ Chiffré via Tunnel VPN (Interne)"
+    else
+      "❌ Non chiffré (Clair / Standard)"
+    end
+  end
+
+  def doh_detect(domain = "cloudflare.com")
+    StateManager.instance.memoized("doh_#{domain}", 60) do
+      begin
+        uri = URI("https://cloudflare-dns.com/dns-query?name=#{domain}&type=A")
+        http = Net::HTTP.new(uri.host, uri.port)
+        http.use_ssl = true
+        http.verify_mode = OpenSSL::SSL::VERIFY_PEER
+        http.open_timeout = 0.5
+        http.read_timeout = 0.8
+        req = Net::HTTP::Get.new(uri)
+        req["accept"] = "application/dns-json"
+        res = http.request(req)
+        res.is_a?(Net::HTTPSuccess) ? JSON.parse(res.body)["Status"] == 0 : false
+      rescue StandardError
+        false
+      end
+    end
+  end
+
+  def dot_detect
+    StateManager.instance.memoized("dot_port_853_check", 30) do
+      begin
+        Socket.tcp("1.1.1.1", 853, connect_timeout: 0.8) { true }
+      rescue StandardError
+        false
+      end
+    end
+  end
+end
+
+module InfrastructureAnalyzer
+  module_function
+
+  def analyze(geo_info, vpn_ctx = nil)
+    return [:unknown, "Fournisseur Inconnu"] if geo_info.nil?
+    asn = geo_info["asn"].to_s
+    org = geo_info["org"].to_s
+    isp = geo_info["isp"].to_s
+    text = "#{asn} #{org} #{isp} #{geo_info["asn_org"]}".downcase.strip
+    provider = resolve_provider(text, vpn_ctx)
+    type = classify_type(text)
+    [type, provider]
+  end
+
+  def resolve_provider(text, vpn_ctx)
+    if text.include?("proton") || (vpn_ctx && vpn_ctx[:proton])
+      "ProtonVPN"
+    elsif text.include?("mullvad")
+      "Mullvad"
+    else
+      provider_name = "Fournisseur Inconnu"
+      keywords = AppConfig.instance.get(:vpn_provider_keywords) || {}
+      keywords.each do |keyword, name|
+        if text.include?(keyword.to_s)
+          provider_name = name
+          break
+        end
+      end
+      provider_name
+    end
+  end
+
+  def classify_type(text)
+    if %w[proton mullvad nordvpn surfshark expressvpn ivpn cyberghost pia private\ internet\ access].any? { |p| text.include?(p) }
+      :vpn
+    elsif %w[aws amazon gcp google\ cloud azure microsoft oracle\ cloud].any? { |p| text.include?(p) }
+      :cloud
+    elsif %w[ovh leaseweb m247 contabo digitalocean linode vultr hetzner].any? { |p| text.include?(p) }
+      :hosting
+    else
+      :isp
+    end
+  end
+end
+
+module VPNDetector
+  module_function
+
+  def active_vpn_interfaces
+    ifconfig_out = StateManager.instance.system_state[:ifconfig]
+    ifconfig_out.scan(/^([a-z0-9]+):/i).flatten.select do |iface|
+      iface.start_with?("utun") || iface.start_with?("wg") || iface.start_with?("ipsec") || iface.start_with?("tailscale") || iface.start_with?("tun")
+    end
+  end
+
+  def wireguard_mtu_detected
+    ifconfig_out = StateManager.instance.system_state[:ifconfig]
+    mtus = ifconfig_out.scan(/mtu\s+(\d+)/i).flatten.map(&:to_i)
+    mtus.include?(1420) || ifconfig_out.scan(/(utun\d+):.*mtu\s+(\d+)/m).any? do |_, mtu_val|
+      mtu = mtu_val.to_i
+      mtu > 576 && mtu <= 1432
+    end
+  end
+
+  def active_vpn_sockets_detected
+    StateManager.instance.memoized("vpn_sockets_scan", 10) do
+      target_ports = [51820, 1194, 500, 4500, 853]
+      detected = false
+      lsof_args = target_ports.flat_map { |port| ["-iUDP:#{port}", "-iTCP:#{port}"] }
+      stdout, status = Open3.capture2("lsof", "-nP", *lsof_args)
+      
+      if status.success?
+        stdout.lines.each do |line|
+          target_ports.each do |port|
+            if line.include?(":#{port}") || (line.include?("->") && line.include?(".#{port} "))
+              detected = true
+              break
+            end
+          end
+          break if detected
+        end
+      end
+      detected
+    end
+  rescue StandardError
+    false
+  end
+
+  def orphan_tunnels_detected(procs)
+    utuns = active_vpn_interfaces.select { |i| i.start_with?("utun") || i.start_with?("tun") }
+    return false if utuns.empty?
+    vpn_processes = %w[wireguard wg tailscaled zerotier openvpn proton tunnel]
+    any_proc_alive = vpn_processes.any? { |p| procs.any? { |x| x.include?(p) } }
+    utuns.any? && !any_proc_alive
+  end
+
+  def active_default_interface
+    route_out = StateManager.instance.system_state[:route]
+    match = route_out.match(/interface:\s*([a-z0-9]+)/i)
+    match ? match[1] : nil
+  rescue StandardError
+    nil
+  end
+
+  def utun_default_route?
+    iface = active_default_interface
+    return false unless iface
+    iface.start_with?("utun") || iface.start_with?("wg") || iface.start_with?("tailscale") || iface.start_with?("tun")
+  end
+
+  def verify_process_signature(process_name)
+    StateManager.instance.memoized("signature_verify_#{process_name}", 3600) do
+      stdout, status = Open3.capture2("which #{process_name}")
+      next false unless status.success?
+      binary_path = stdout.strip
+      _, sig_status = Open3.capture2("codesign", "-v", binary_path)
+      sig_status.success?
+    end
+  rescue StandardError
+    false
+  end
+
+  def vpn_state(procs = process_snapshot_global, geo_info = nil)
+    @vpn_state_cache ||= { ts: 0, value: nil }
+    now = Time.now.to_i
+    return @vpn_state_cache[:value] if @vpn_state_cache[:value] && (now - @vpn_state_cache[:ts] < 8)
+
+    vpn_processes = %w[wireguard wg tailscaled zerotier-one openvpn protonvpn proton ProtonVPNService]
+    proc_active = vpn_processes.any? { |p| procs.any? { |x| x.include?(p.downcase) } }
+    scutil_out = StateManager.instance.system_state[:scutil]
+    ifconfig_out = StateManager.instance.system_state[:ifconfig]
+    utuns = active_vpn_interfaces
+    utun_route = utun_default_route?
+    has_vpn_sockets = active_vpn_sockets_detected
+    has_vpn_mtu = wireguard_mtu_detected
+
+    interface_active = scutil_out.include?("utun") || scutil_out.include?("tun") || ifconfig_out.include?("POINTOPOINT") || !utuns.empty? || utun_route || has_vpn_mtu
+    vpn_active_confirmed = (proc_active && interface_active) || (has_vpn_sockets && interface_active)
+
+    proton_wireguard = vpn_active_confirmed && (utun_route || utuns.any? || procs.any? { |x| x.include?("wg") || x.include?("wireguard") })
+    proton_detected = vpn_active_confirmed && (procs.any? { |p| p.include?("proton") && p.include?("vpn") } || scutil_out.downcase.include?("proton") || (utun_route && !utuns.empty? && procs.any? { |p| p.include?("proton") }) || proton_wireguard)
+
+    infra_type, vpn_provider = InfrastructureAnalyzer.analyze(geo_info, { proton: proton_detected })
+    confidence_score = vpn_confidence(vpn_active_confirmed, vpn_provider, infra_type, has_vpn_mtu, has_vpn_sockets, procs)
+
+    signature_trusted = true
+    %w[wireguard tailscaled openvpn].each do |binary|
+      if procs.include?(binary)
+        signature_trusted = verify_process_signature(binary)
         break
       end
     end
 
-    if ip
-      store_last_known_good_ip(ip)
-      ip
-    else
-      last_known_good_ip
+    result = {
+      active: vpn_active_confirmed,
+      wireguard: vpn_active_confirmed && (procs.include?("wireguard") || procs.include?("wg-quick") || has_vpn_mtu || (ifconfig_out.include?("wg") && ifconfig_out.include?("POINTOPOINT"))),
+      tailscale: vpn_active_confirmed && procs.include?("tailscaled"),
+      zerotier: vpn_active_confirmed && procs.include?("zerotier-one"),
+      openvpn: ifconfig_out.include?("tun") || procs.include?("openvpn"),
+      proton: proton_detected,
+      confidence: confidence_score,
+      provider: vpn_provider,
+      infrastructure: infra_type,
+      signature_verified: signature_trusted,
+      heuristics: { mtu_match: has_vpn_mtu, sockets_match: has_vpn_sockets, orphan_leak: orphan_tunnels_detected(procs) }
+    }
+    @vpn_state_cache = { ts: now, value: result }
+    result
+  end
+
+  def vpn_confidence(vpn_active_confirmed, vpn_provider, infra_type, has_vpn_mtu, has_vpn_sockets, procs)
+    score = 0
+    score += 55 if vpn_active_confirmed
+    score += 35 if vpn_provider != "Fournisseur Inconnu"
+    case infra_type
+    when :vpn then score += 20
+    when :hosting then score += 5
+    when :cloud then score += 2
     end
+    score += 15 if has_vpn_mtu
+    score += 15 if has_vpn_sockets
+    score = 100 if vpn_active_confirmed && procs.include?("tailscaled")
+    score = [score, 95].max if vpn_active_confirmed && procs.include?("zerotier-one")
+    [[score, 0].max, 100].min
   end
 end
 
-def fetch_geo_provider(url)
-  uri = URI(url)
-  req = Net::HTTP::Get.new(uri)
-  req["User-Agent"] = "xbar-vpn-checker/#{APP_VERSION}"
+def global_network_context
+  StateManager.instance.memoized("global_net_ctx", 10) do
+    ip = IPFetcher.instance.fetch
+    ip = IPGuard.sanitize(ip)
+    procs = ProcessSnapshot.instance.get  # ✅ Utilise ProcessSnapshot
+    geo_info = ip ? StateManager.instance.memoized("geo_#{ip}", 300) { GeoLookup.instance.lookup(ip) } : GeoLookup.instance.local_geo_fallback
+    vpn_st = VPNDetector.vpn_state(procs, geo_info)
+    tor_active = TorDetector.active?(ip, procs)  # ✅ Utilise TorDetector
+    apple_relay = apple_relay_ip?(ip, geo_info)  # ✅ Utilise apple_relay_ip?
 
-  # Utilisation exclusive des timeouts natifs de Net::HTTP
-  res = Net::HTTP.start(uri.host, uri.port, 
-                        use_ssl: uri.scheme == 'https', 
-                        verify_mode: OpenSSL::SSL::VERIFY_PEER, 
-                        open_timeout: 1.5, 
-                        read_timeout: 2.0,
-                        write_timeout: 1.5) do |http|
-    http.get(uri.request_uri)
+    # Calcul du type de connexion
+    connection_type = if vpn_st[:active]
+                         "Tunnel VPN"
+                       elsif vpn_st[:infrastructure] == :isp
+                         "Ligne Directe (ISP)"
+                       else
+                         "Infrastructure Cloud / Hébergement"
+                       end
+
+    {
+      ip: ip,
+      geo: geo_info,
+      vpn_state: vpn_st,
+      dns: DNSAnalyzer.collect,
+      perf: PerformanceMonitor.measure_network_perf,
+      procs: procs,
+      connection_type: connection_type,  # ✅ Ajout
+      apple_relay: apple_relay,          # ✅ Ajout
+      tor: tor_active                      # ✅ Ajout
+    }
   end
-  
-  res.is_a?(Net::HTTPSuccess) ? JSON.parse(res.body.to_s) : nil
-rescue StandardError => e 
-  # Cela capturera automatiquement Net::OpenTimeout et Net::ReadTimeout
-  debug("fetch_geo_provider fail pour #{url}: #{e.class} - #{e.message}")
-  nil
 end
 
-def geo(ip)
-  cleaned_ip = ip.to_s.strip
-  return local_geo_fallback(cleaned_ip) unless IPGuard.sanitize(cleaned_ip)
+# ==============================================================================
+# MODULES MANQUANTS (À AJOUTER ICI)
+# ==============================================================================
 
-  DiskCache.fetch("geo_v9_#{cleaned_ip}", ttl: 86_400) do
-    urls = [
-      { url: "https://ipwho.is/#{cleaned_ip}", parser: "ipwho" },
-      { url: "https://ip-api.com/json/#{cleaned_ip}?fields=status,countryCode,org,as,isp", parser: "ipapi" }
-    ]
+module TorDetector
+  TOR_CACHE_FILE = File.join(DiskCache::CACHE_DIR, "tor_exit_nodes.json")
+  $tor_state ||= { ts: Time.at(0), ips: Set.new }
+  $cache_mutex ||= Mutex.new
 
-    threads = urls.map do |entry|
-      Thread.new do
-        raw = fetch_geo_provider(entry[:url])
-        normalize_geo(raw, entry[:parser])
+  module_function
+
+  def tor?(ip)
+    return false unless IPGuard.sanitize(ip)
+    StateManager.instance.memoized("tor_check_#{ip}", 1800) { tor_fetch_exit_nodes.include?(IPGuard.parse(ip).to_s) }
+  end
+
+  def tor_process?(procs = ProcessSnapshot.instance.get)
+    procs.include?("tor") || procs.include?("obfs4proxy")
+  rescue StandardError
+    false
+  end
+
+  def tor_socks?
+    StateManager.instance.memoized("tor_socks", 30) do
+      begin
+        socket = TCPSocket.new("127.0.0.1", 9050)
+        socket.write("\x05\x01\x00")
+        response = socket.readpartial(2)
+        socket.close
+        response == "\x05\x00"
+      rescue StandardError
+        false
       end
     end
+  end
 
-    # Attend tous les threads et prend le premier résultat valide
-    results = threads.map(&:value).compact
-    results.first || local_geo_fallback(cleaned_ip)
+  def active?(ip, procs)
+    tor?(ip) || tor_process?(procs) || tor_socks?
+  end
+
+  def tor_fetch_exit_nodes
+    now = Time.now
+    $cache_mutex.synchronize do
+      return $tor_state[:ips] if (now - $tor_state[:ts]) < 14_400 && !$tor_state[:ips].empty?
+    end
+
+    begin
+      if File.exist?(TOR_CACHE_FILE)
+        cached = JSON.parse(File.read(TOR_CACHE_FILE)) rescue nil
+        if cached.is_a?(Hash) && cached["ts"] && cached["ips"].is_a?(Array)
+          if Time.now.to_i - cached["ts"].to_i < 14_400
+            ips = Set.new(cached["ips"])
+            $cache_mutex.synchronize { $tor_state = { ts: Time.now, ips: ips } }
+            return ips
+          end
+        end
+      end
+    rescue StandardError
+    end
+
+    downloaded_ips = Set.new
+    begin
+      uri = URI("https://check.torproject.org/exit-addresses")
+      body = Net::HTTP.start(uri.host, uri.port,
+                            use_ssl: true,
+                            verify_mode: OpenSSL::SSL::VERIFY_PEER,
+                            open_timeout: 2.0,
+                            read_timeout: 4.0) do |http|
+        response = http.get(uri.request_uri)
+        response.is_a?(Net::HTTPSuccess) ? response.body : nil
+      end
+
+      body.to_s.each_line do |line|
+        next unless line.start_with?("ExitAddress")
+        ip = line.split(" ", 2).last.to_s.strip
+        downloaded_ips.add(ip) if IPGuard.valid_format?(ip)
+      end
+    rescue StandardError
+    end
+
+    if downloaded_ips.any?
+      begin
+        tmp_file = "#{TOR_CACHE_FILE}.tmp.#{$$}"
+        File.write(tmp_file, JSON.generate({ ts: Time.now.to_i, ips: downloaded_ips.to_a }))
+        File.chmod(0600, tmp_file)
+        File.rename(tmp_file, TOR_CACHE_FILE)
+      rescue StandardError
+      end
+      $cache_mutex.synchronize { $tor_state = { ts: Time.now, ips: downloaded_ips } }
+      return downloaded_ips
+    end
+
+    $cache_mutex.synchronize { return $tor_state[:ips] unless $tor_state[:ips].empty? }
+    Set.new
   end
 end
 
-def geo_with_ip_cache(ip)
-  return local_geo_fallback(nil) unless ip
-  memoized("geo_for_#{ip}", 86400) { geo(ip) }
+def apple_relay_ip?(ip, geo_data = nil)
+  return false unless IPGuard.sanitize(ip)
+  geo_data ||= {}
+  org = geo_data["org"].to_s.downcase
+  asn = geo_data["asn"].to_s.upcase.gsub("AS", "")
+  (AppConfig.instance.get(:apple_relay_asns) || []).include?(asn) ||
+    org.include?("apple-relay") ||
+    org.include?("icloud data protection")
 end
 
-def normalize_geo(data, provider)
-  return nil if data.nil? || data.empty?
-  case provider
-  when "ipwho"
-    return nil if data["success"] == false
-    conn = data["connection"] || {}
-    {
-      "country_code" => data["country_code"] || data["country"],
-      "org" => conn["org"],
-      "isp" => conn["isp"],
-      "asn" => conn["asn"] ? "AS#{conn["asn"]}" : nil,
-      "asn_org" => conn["org"]
-    }
-  when "ipapi"
-    return nil if data["status"] == "fail"
-    asn_num = data["as"] ? data["as"].split(" ").first : nil
-    {
-      "country_code" => data["countryCode"],
-      "org" => data["org"],
-      "isp" => data["isp"],
-      "asn" => asn_num,
-      "asn_org" => data["org"]
-    }
-  end
-end
+# ==============================================================================
+# MODULE PERFORMANCE
+# ==============================================================================
+module PerformanceMonitor
+  PING_HOSTS = %w[1.1.1.1 8.8.8.8].freeze
 
-def active_vpn_interfaces
-  # -l affiche une liste séparée par des espaces, -u filtre celles qui sont "UP"
-  stdout, status = Open3.capture2("ifconfig", "-l", "-u")
-  return [] unless status.success?
+  module_function
 
-  # On récupère les interfaces et on filtre celles liées aux VPN
-  stdout.strip.split.select do |iface|
-    iface.start_with?("utun") || iface.start_with?("wg") || iface.start_with?("ipsec")
-  end
-rescue StandardError => e
-  debug("Erreur active_vpn_interfaces: #{e.message}")
-  []
-end
+    def measure_network_perf
+    LRUCachePro.instance.fetch("network_perf_live_metrics", ttl: 4) do
+      latency_values = []
 
-def active_default_interface
-  # Demande explicitement à macOS l'interface utilisée pour le trafic sortant
-  stdout, status = Open3.capture2("route", "-n", "get", "default")
-  return nil unless status.success?
+      threads = PING_HOSTS.map do |host|
+        Thread.new do
+          begin
+            stdout, status = Open3.capture2("ping", "-c", "2", "-t", "1", host)
+            if status.success?
+              times = stdout.scan(/time=([0-9.]+)\s*ms/).flatten.map(&:to_f)
+              times unless times.empty?
+            end
+          rescue
+            nil
+          end
+        end
+      end
 
-  # On cherche la ligne "interface: en0" ou "interface: utun2"
-  match = stdout.match(/interface:\s*([a-z0-9]+)/i)
-  match ? match[1] : nil
-rescue StandardError => e
-  debug("Erreur active_default_interface: #{e.message}")
-  nil
-end
+      threads.each { |t| res = t.value; latency_values.concat(res) if res }
 
-def utun_default_route?
-  iface = active_default_interface
-  return false unless iface
-  
-  iface.start_with?("utun") || iface.start_with?("wg") || iface.start_with?("tailscale")
-end
-
-
-
-def proton_wireguard_detected?(procs, utuns, scutil_out)
-  return true if procs.any? { |p| p.include?("proton") && p.include?("vpn") }
-  return true if scutil_out.downcase.include?("proton")
-  return true if !utuns.empty?
-  false
-end
-
-def tor_fetch_exit_nodes
-  $cache_mutex.synchronize do
-    return $tor_state[:ips] if Time.now - $tor_state[:ts] < 14400
-  end
-
-  raw = begin
-    uri = URI("https://check.torproject.org/exit-addresses")
-    # Timeouts natifs gèrent la résilience
-    Net::HTTP.start(uri.host, uri.port, 
-                    use_ssl: true, 
-                    verify_mode: OpenSSL::SSL::VERIFY_PEER, 
-                    open_timeout: 1.5, 
-                    read_timeout: 2.0,
-                    write_timeout: 1.5) do |http|
-      res = http.get(uri.request_uri)
-      res.is_a?(Net::HTTPSuccess) ? res.body : nil
+      if latency_values.empty?
+        { latency: "--", jitter: "--" }
+      else
+        avg_latency = (latency_values.sum / latency_values.size.to_f).round(1)
+        diffs = []
+        latency_values.each_cons(2) { |a, b| diffs << (a - b).abs }
+        avg_jitter = diffs.empty? ? (avg_latency * 0.05).round(1) : (diffs.sum / diffs.size.to_f).round(1)
+        { latency: "#{avg_latency} ms", jitter: "#{avg_jitter} ms" }
+      end
     end
   rescue StandardError
-    debug("tor_fetch_exit_nodes fail")  # ✅ Pas de variable inutilisée
-    nil
-  end
-
-  ips = {}
-  raw.to_s.each_line do |line|
-    next unless line.start_with?("ExitAddress")
-    ip = line.split(" ", 2).last.to_s.strip
-    ips[ip] = true if IPGuard.valid_format?(ip)
-  end
-
-  $cache_mutex.synchronize do
-    if ips.any?
-      $tor_state = { ts: Time.now, ips: ips }
-    elsif $tor_state[:ips].any?
-      $tor_state[:ts] = Time.now - 14400 + 900
-    end
-  end
-  
-  ips.any? ? ips : $tor_state[:ips]
-end
-
-def apple_relay_ip?(ip, geo_info = nil)
-  return false unless IPGuard.sanitize(ip)
-  geo_info ||= {}
-  org = geo_info["org"].to_s.downcase
-  asn = geo_info["asn"].to_s.upcase.gsub("AS", "")
-
-  APPLE_RELAY_ASNS.include?(asn) || org.include?("apple-relay") || org.include?("icloud data protection")
-end
-
-def tor?(ip)
-  return false unless IPGuard.sanitize(ip)
-  memoized("tor_check_#{ip}", 1800) do
-    tor_fetch_exit_nodes.key?(IPGuard.parse(ip).to_s)
+    { latency: "--", jitter: "--" }
   end
 end
 
-def tor_process?(procs = process_snapshot_global)
-  # On vérifie directement dans le Set (très rapide)
-  procs.include?("tor") || procs.include?("obfs4proxy")
-rescue StandardError
-  false
-end
 
-def tor_socks?
-  memoized("tor_socks", 30) do
-    begin
-      socket = TCPSocket.new("127.0.0.1", 9050)
-      socket.write("\x05\x01\x00")
-      response = socket.readpartial(2)
-      socket.close
-      response == "\x05\x00"
-    rescue StandardError => e
-      debug("tor_socks? local check failed (Tor absent ou SOCKS désactivé)")
-      false
-    end
-  end
-end
 
 # ==============================================================================
-# 6. INFRASTRUCTURE & ANALYSE DE SECURITE RESEAU
+# 13. ENGINE DE SORTIE & RENDER (XBAR) - FIX DÉFINITIF LATENCE / JITTER
 # ==============================================================================
-def classify_infra(asn, org)
-  text = "#{asn} #{org}".downcase
-  return :vpn if %w[proton mullvad nordvpn surfshark expressvpn ivpn cyberghost pia private\ internet\ access].any? { |p| text.include?(p) }
-  return :cloud if %w[aws amazon gcp google\ cloud azure microsoft oracle\ cloud].any? { |p| text.include?(p) }
-  return :hosting if %w[ovh leaseweb m247 contabo digitalocean linode vultr hetzner worldstream scaleway datacenter hosting].any? { |p| text.include?(p) }
-  return :isp if %w[orange sfr free bouygues kpn ziggo vodafone proximus t-mobile telecom xs4all freedom internet comcast at&t charter spectrum verizon].any? { |p| text.include?(p) }
-  :unknown
-end
+def render_xbar
+  # Récupération du contexte global généré par le refactor
+  ctx_global = global_network_context
+  vpn_st     = ctx_global[:vpn_state]
+  geo_data   = ctx_global[:geo]
+  raw_dns    = ctx_global[:dns]
 
-def resolve_vpn_provider(org, asn, isp, vpn_ctx = nil)
-  text = "#{org} #{isp}".downcase
+  vpn_active = vpn_st[:active]
+  dns_split  = DNSAnalyzer.normalize(raw_dns, vpn_active)
+  d_health   = DNSAnalyzer.health(dns_split[:public], dns_split[:vpn], vpn_active, geo_data)
 
-  return "ProtonVPN" if text.include?("proton")
-  return "Mullvad" if text.include?("mullvad")
-
-  return "ProtonVPN" if vpn_ctx && vpn_ctx[:proton]
-
-  VPN_PROVIDER_KEYWORDS.each do |keyword, name|
-    return name if text.include?(keyword)
+  # Récupération résiliente et dynamique des vraies mesures de performance
+  perf = nil
+  if ctx_global.is_a?(Hash) && ctx_global[:perf]
+    perf = ctx_global[:perf]
+  elsif defined?(PerformanceMonitor) && PerformanceMonitor.respond_to?(:measure_network_perf)
+    perf = PerformanceMonitor.measure_network_perf
   end
-
-  "Fournisseur Inconnu"
-end
-
-def connection_type(infra_type, vpn_enabled)
-  return "Tunnel VPN" if vpn_enabled
-  infra_type == :isp ? "Ligne Directe (ISP)" : "Infrastructure Cloud / Hébergement"
-end
-
-def vpn_state(procs = process_snapshot_global)
-  @vpn_state_cache ||= { ts: Time.at(0), value: nil }
-  now = Time.now.to_i
-  return @vpn_state_cache[:value] if @vpn_state_cache[:value] && (now - @vpn_state_cache[:ts] < 8)
-
-  vpn_processes = %w[wireguard wg tailscaled zerotier-one openvpn protonvpn proton ProtonVPN ProtonVPNService]
-  proc_active = vpn_processes.any? { |p| procs.any? { |x| x.include?(p.downcase) } }
-
-  scutil_out, _ = Open3.capture2("scutil", "--nwi")
-  ifconfig_out, _ = Open3.capture2("ifconfig")
   
-  utuns = active_vpn_interfaces
-  utun_route = utun_default_route?
-  
-  interface_active =
-    scutil_out.include?("utun") ||
-    ifconfig_out.include?("POINTOPOINT") ||
-    !utuns.empty? ||
-    utun_route
+  # Structuration propre des fallbacks d'affichage (-- ms au lieu de 0 ms si KO/Indisponible)
+  display_latency = (perf && perf[:latency]) ? perf[:latency].to_s : "-- ms"
+  display_jitter  = (perf && perf[:jitter])  ? perf[:jitter].to_s  : "-- ms"
 
-  vpn_active_confirmed = proc_active && interface_active
+  # Configuration centralisée via AppConfig
+  app_version   = AppConfig.instance.get(:app_version) || "v3.1.5"
+  colors        = AppConfig.instance.get(:colors) || {}
+  color_secure  = colors['secure'] || "#006400"
+  color_warn    = colors['warn']   || "#FF9500"
+  color_alert   = colors['alert']  || "#FF3B30"
+  dns_providers = AppConfig.instance.get(:dns_providers) || {}
 
-  proton_wireguard = vpn_active_confirmed && (utun_route || utuns.any? || procs.any? { |x| x.include?("wg") || x.include?("wireguard") })
-
-result = {
-  active: vpn_active_confirmed,
-  wireguard: vpn_active_confirmed && (procs.include?("wireguard") || procs.include?("wg-quick") || ifconfig_out.include?("wg") && ifconfig_out.include?("POINTOPOINT")),
-  tailscale: vpn_active_confirmed && procs.include?("tailscaled"),
-  zerotier: vpn_active_confirmed && procs.include?("zerotier-one"),
-  proton: vpn_active_confirmed && proton_wireguard_detected?(procs, utuns, scutil_out)
-}
-
-  @vpn_state_cache = { ts: now, value: result }
-  result
-end
-
-def vpn_confidence(vpn_enabled_real, vpn_provider, infra, procs)
-  score = 0
-  score += 60 if vpn_enabled_real
-  score += 35 if vpn_provider != "Fournisseur Inconnu"
-
-  case infra
-  when :vpn then score += 20
-  when :hosting then score += 5
-  when :cloud then score += 2
-  end
-
-  score = 100 if vpn_enabled_real && procs.include?("tailscaled")
-  score = [score, 95].max if vpn_enabled_real && procs.include?("zerotier-one")
-  [score, 100].min
-end
-
-def generate_security_score_v2(public_ip, dns_health, dns_status, tor_active, vpn_active, dns_encrypted, vpn_confidence, infra_type, country_code)
-  unless IPGuard.sanitize(public_ip)
-    score = 50
-    score += 20 if dns_encrypted
-    score -= 30 if dns_health[:leak]
-    return [[score, 0].max, 100].min
-  end
-
-  score = 70
-  score -= 20 if tor_active
-  score += 10 if dns_encrypted
-  score -= 15 if dns_health[:leak]
-  score += 8  if vpn_active
-  score += 6  if vpn_confidence >= 80
-  score += 5  if vpn_confidence >= 50
-
-  if DENY_COUNTRIES.include?(country_code)
-    score -= 30
-  elsif ALLOWED_COUNTRIES.include?(country_code)
-    score += 5
-  end
-
-  case dns_status
-  when :dns_secure then score += 5
-  when :dns_uncertain then score -= 5
-  when :dns_leak then score -= 25
-  end
-
-  case infra_type
-  when :vpn     then score += 5
-  when :hosting then score += 2
-  when :cloud   then score -= 10
-  end
-
-  [[score, 0].max, 100].min
-end
-
-def network_fingerprint(ip, geo_data)
-  Digest::SHA256.hexdigest([ip, geo_data["asn"], geo_data["org"]].join("|"))[0..14]
-end
-
-def fingerprint_changed?(fp)
-  path = File.join(DiskCache::CACHE_DIR, "last_fp")
-  old = File.exist?(path) ? File.read(path).strip : nil
-  File.write(path, fp)
-  old && old != fp
-end
-
-def vpn_rotation(current_ip, geo)
-  path = File.join(DiskCache::CACHE_DIR, "vpn_rotation.json")
-  old = File.exist?(path) ? JSON.parse(File.read(path)) : {}
-
-  current = { ip: current_ip, asn: geo["asn"], country: geo["country_code"] }
-  File.write(path, JSON.generate(current))
-  return nil if old.empty?
-  changed = old["ip"] != current[:ip] || old["asn"] != current[:asn] || old["country"] != current[:country]
-  changed ? { old_country: old["country"], new_country: current[:country], old_asn: old["asn"], new_asn: current[:asn] } : nil
-rescue StandardError
-  nil
-end
-
-def killswitch_broken?(vpn_active, infra_type)
-  return false unless vpn_active
-  iface = active_default_interface
-  if iface && !iface.start_with?("utun") && !iface.start_with?("wg")
-    # Vérifier aussi les routes IPv6 (si disponible)
-    begin
-      ipv6_route, _ = Open3.capture2("route", "-n", "get", "-6", "default")
-      return true if ipv6_route.include?("interface: #{iface}")
-    rescue StandardError
-      # Ignore si la commande échoue (macOS ancien)
-    end
-  end
-  false
-end
-
-# ==============================================================================
-# 7. COUCHE SYSTEM DNS & HEALTH ANALYSIS
-# ==============================================================================
-def system_dns
-  # Suppression du DiskCache lourd au profit d'une exécution directe.
-  # La méthode globale global_network_context applique déjà un memoized de 10s en RAM.
-  stdout, status = Open3.capture2("scutil", "--dns")
-  return system_dns_fallback unless status.success?
-  
-  dns_list = stdout.scan(/nameserver\[\d+\]\s*:\s*([0-9a-fA-F:\.]+)/i).flatten.uniq.select { |ip|
-    IPGuard.valid_format?(ip)
-  }
-  
-  dns_list.empty? ? system_dns_fallback : dns_list
-rescue StandardError => e
-  debug("system_dns extraction failed: #{e.message}")
-  []
-end
-
-def system_dns_fallback
-  stdout, _ = Open3.capture2("networksetup", "-getdnsservers", "Wi-Fi")
-  stdout.lines.map(&:strip).select { |x| IPGuard.valid_format?(x) }
-rescue
-  []
-end
-
-def doh_detect(domain = "cloudflare.com")
-  memoized("doh_#{domain}", 60) do
-    begin
-      uri = URI("https://cloudflare-dns.com/dns-query?name=#{domain}&type=A")
-      http = Net::HTTP.new(uri.host, uri.port)
-      http.use_ssl = true
-      http.verify_mode = OpenSSL::SSL::VERIFY_PEER
-      # Définition stricte des timeouts sur la connexion
-      http.open_timeout = 0.5
-      http.read_timeout = 0.8
-      http.write_timeout = 0.5
-
-      req = Net::HTTP::Get.new(uri)
-      req["accept"] = "application/dns-json"
-      
-      res = http.request(req)
-      res.is_a?(Net::HTTPSuccess) ? JSON.parse(res.body)["Status"] == 0 : false
-    rescue StandardError => e
-      debug("doh_detect error: #{e.message}")
-      false
-    end
-  end
-end
-
-def normalize_dns_pack(dns_list, vpn_active)
-  local, vpn, public_dns = [], [], []
-  dns_list.each do |ip|
-    next unless IPGuard.valid_format?(ip)
-    if IPGuard.localhost?(ip)
-      local << ip
-    elsif IPGuard.private_ip?(ip)
-      vpn_active ? vpn << ip : local << ip
-    else
-      public_dns << ip
-    end
-  end
-  { local: local.uniq, vpn: vpn.uniq, public: public_dns.uniq }
-end
-
-def dns_consistency(vpn_detected, local_dns, vpn_dns, public_dns)
-  # Si aucun VPN n'est détecté, il est normal d'utiliser des résolveurs publics ou locaux
-  return "🟢 Cohérent (Réseau Standard)" unless vpn_detected
-
-  has_vpn_dns = vpn_dns.any?
-  has_pub_dns = public_dns.any?
-
-  case
-  when has_vpn_dns && !has_pub_dns
-    "🔐 Sécurisé (Tunnel DNS Exclusif)"
-  when has_vpn_dns && has_pub_dns
-    "🟡 Mixte (Tunnel + Résolveurs Publics)"
-  when has_pub_dns
-    "⚠️ Danger (Fuite DNS probable)"
-  else
-    "🟢 Sécurisé (DNS Local/Inconnu)"
-  end
-end
-
-def dns_health_check(public_dns, vpn_dns, vpn_active, current_ip_geo = nil)
-  public_dns ||= []
-  vpn_dns ||= []
-
-  all_dns = public_dns + vpn_dns
-  all_dns += system_dns.select { |ip| ip.include?(":") } # IPv6
-
-  doh_active = doh_detect
-
-  encryption_active = vpn_dns.any? || public_dns.include?("127.0.0.1") || public_dns.include?("::1") || doh_active
-  leak = false
-  leak_reasons = []
-
-  if vpn_active
-    public_dns.each do |dns_ip|
-      next if TRUSTED_DNS.include?(dns_ip)
-      dns_geo = geo_with_ip_cache(dns_ip)
-      next unless dns_geo
-
-      dns_asn = dns_geo["asn"].to_s.upcase.gsub("AS", "")
-      vpn_asn = current_ip_geo&.dig("asn").to_s.upcase.gsub("AS", "")
-
-      next if dns_asn.empty? || dns_asn == "0"
-      next if KNOWN_SAFE_DNS_ASNS.include?(dns_asn)
-      next if !vpn_asn.empty? && dns_asn == vpn_asn
-
-      leak = true
-      leak_reasons << { dns: dns_ip, dns_asn: dns_asn, vpn_asn: vpn_asn }
-    end
-
-    if vpn_dns.empty? && public_dns.any? && leak_reasons.empty?
-      leak = true
-    end
-  end
-
-  status = if leak
-             :dns_leak
-           elsif encryption_active
-             :dns_secure
-           else
-             :dns_uncertain
-           end
-
-  {
-    leak: leak,
-    encryption: encryption_active,
-    isolation: vpn_active ? !leak : encryption_active,
-    status: status,
-    leak_reasons: leak_reasons
-  }
-end
-
-def measure_network_perf
-  target = PING_HOSTS.first || "1.1.1.1"
-  samples = []
-  10.times do
-    start = Time.now
-    success = Socket.tcp(target, 53, connect_timeout: 0.25) { true } rescue false
-    samples << ((Time.now - start) * 1000).round if success
-    sleep(0.01)
-  end
-  return { latency: 999, jitter: 0 } if samples.empty?
-  avg = (samples.sum / samples.size.to_f).round
-  diffs = samples.each_cons(2).map { |a, b| (a - b).abs }
-  { latency: avg, jitter: diffs.empty? ? 0 : (diffs.sum / diffs.size.to_f).round }
-end
-
-# ==============================================================================
-# 8. TRUE LAZY PROXY PATTERN
-# ==============================================================================
-class RealLazyCtx
-  def initialize(&block)
-    @block = block
-    @evaluated_data = nil
-    @eval_mutex = Mutex.new
-  end
-
-  def [](key)
-    @eval_mutex.synchronize { @evaluated_data ||= @block.call }
-    @evaluated_data[key]
-  end
-
-  def get(key)
-    self[key]
-  end
-end
-
-def build_ctx_lazy(raw)
-  RealLazyCtx.new do
-    dns_split = raw[:dns_split]
-    dns_health = raw[:dns_health]
-    infra_source = "#{raw.dig(:geo, "org")} #{raw.dig(:geo, "isp")} #{raw.dig(:geo, "asn_org")}".downcase.strip
-    infra_type = classify_infra(raw.dig(:geo, "asn"), infra_source)
-    country_code = raw.dig(:geo, "country_code")
-
-    {
-      ip: raw[:ip],
-      isp: raw.dig(:geo, "isp") || raw.dig(:geo, "org") || raw.dig(:geo, "asn_org"),
-      network_type: infra_type,
-      connection_type: connection_type(infra_type, raw[:vpn_enabled_real]),
-      country: country_code,
-      vpn: raw[:vpn_detected],
-      vpn_suspected: raw[:vpn_suspected],
-      vpn_confidence: raw[:vpn_confidence_score],
-      vpn_provider: raw[:vpn_provider],
-      vpn_enabled: raw[:vpn_enabled_real],
-      apple_relay: raw[:apple_relay_detected],
-      tor: raw[:tor_exit],
-      tor_process: raw[:tor_proc],
-      tor_socks: raw[:tor_socks_status],
-      wireguard: raw[:wireguard_on],
-      tailscale: raw[:tailscale_on],
-      zerotier: raw[:zerotier_on],
-      dns_leak: dns_health[:leak],
-      dns_encrypted: dns_health[:encryption],
-      dns_status: dns_health[:status],
-      dns_local: raw[:dns_local],
-      dns_vpn: raw[:dns_vpn],
-      dns_public: raw[:dns_public],
-      dns_isolation: raw[:dns_isolation],
-      latency: raw[:lat],
-      jitter: raw[:jit],
-      fingerprint: network_fingerprint(raw[:ip], raw[:geo] || {}),
-      score: generate_security_score_v2(
-        raw[:ip], dns_health, dns_health[:status], raw[:tor_exit],
-        raw[:vpn_enabled_real], dns_health[:encryption], raw[:vpn_confidence_score], infra_type, country_code
-      ),
-      dns_consistency: dns_consistency(raw[:vpn_enabled_real], dns_split[:local], dns_split[:vpn], dns_split[:public])
-    }
-  end
-end
-
-# ==============================================================================
-# 9. ENGINE EXECUTION MAIN BLOCK
-# ==============================================================================
-def main
-  STDOUT.set_encoding('utf-8') if STDOUT.respond_to?(:set_encoding)
-  ctx_net = global_network_context
-
-  clean_public_ip   = ctx_net[:ip]
-  geo_info          = ctx_net[:geo] || local_geo_fallback(nil)
-  active_dns        = ctx_net[:dns]
-  perf              = ctx_net[:perf]
-  vpn_ctx           = ctx_net[:vpn_state]
-  procs             = ctx_net[:procs]
-  tor_proc          = tor_process?
-  tor_socks_status  = tor_socks?
-
-  local_ip = fallback_local_ip
-  current_ip = (clean_public_ip || local_ip).to_s.strip
-  tor_exit = current_ip ? tor?(current_ip) : false
-
-  $runtime_ctx[:using_public_ip] = !!clean_public_ip
-  $runtime_ctx[:fallback_used]   = clean_public_ip.nil? && !local_ip.nil?
-  asn = geo_info["asn"].to_s
-  org = geo_info["org"].to_s
-  isp = geo_info["isp"].to_s
-  infra_source = "#{org} #{isp} #{geo_info["asn_org"]}".downcase.strip
-  infra_type = classify_infra(asn, infra_source)
-  datacenter_proxy = (infra_type == :hosting)
-
-  vpn_enabled_real = vpn_ctx[:active]
-  
-  confidence = vpn_confidence(vpn_enabled_real, resolve_vpn_provider(org, asn, isp), infra_type, procs)
-  
-  vpn_detected = vpn_enabled_real || (infra_type == :vpn && confidence >= 75)
-  vpn_suspected = !vpn_enabled_real && $runtime_ctx[:using_public_ip] && (infra_type == :vpn || confidence >= 60)
-
-  dns_split = normalize_dns_pack(active_dns, vpn_enabled_real)
-  
-  dns_health = dns_health_check(dns_split[:public], dns_split[:vpn], vpn_enabled_real, geo_info)
-  apple_relay_detected = apple_relay_ip?(current_ip, geo_info)
-
-  raw_data = {
-    ip:                    current_ip,
-    geo:                   geo_info,
-    dns_split:             dns_split,
-    dns_health:            dns_health,
-    dns_local:             dns_split[:local],
-    dns_vpn:               dns_split[:vpn],
-    dns_public:            dns_split[:public],
-    dns_isolation:         dns_health[:isolation],
-    vpn_detected:          vpn_detected,
-    vpn_suspected:         vpn_suspected,
-    vpn_confidence_score:  confidence,
-    vpn_enabled_real:      vpn_enabled_real,
-    vpn_provider:          resolve_vpn_provider(org, asn, isp, vpn_ctx),
-    tor_proc:              tor_proc,
-    tor_socks_status:      tor_socks_status,
-    tor_exit:              tor_exit,
-    lat:                   perf[:latency],
-    jit:                   perf[:jitter],
-    apple_relay_detected:  apple_relay_detected,
-    wireguard_on:          vpn_ctx[:wireguard],
-    tailscale_on:          vpn_ctx[:tailscale],
-    zerotier_on:           vpn_ctx[:zerotier]
-  }
-
-  ctx = build_ctx_lazy(raw_data)
-  fp_changed = fingerprint_changed?(ctx.get(:fingerprint))
-  killswitch = killswitch_broken?(vpn_enabled_real, infra_type)
-  rotation = vpn_enabled_real ? vpn_rotation(current_ip, geo_info) : nil
-
+  # Gestion du Mode JSON
   if JSON_MODE
     puts JSON.generate({
-      software: { name: "xbar-vpn-flag", version: APP_VERSION },
-      network: {
-        ip: ctx.get(:ip), country: ctx.get(:country), provider: geo_info["asn_org"], asn: geo_info["asn"],
-        infrastructure_type: ctx.get(:network_type).to_s.upcase, connection_type: ctx.get(:connection_type),
-        latency_ms: ctx.get(:latency), jitter_ms: ctx.get(:jitter), fingerprint: ctx.get(:fingerprint)
-      },
-      security: {
-        vpn_active: ctx.get(:vpn), vpn_suspected: ctx.get(:vpn_suspected), vpn_confidence: ctx.get(:vpn_confidence),
-        vpn_enabled_interface: ctx.get(:vpn_enabled), vpn_provider_resolved: ctx.get(:vpn_provider),
-        apple_private_relay: ctx.get(:apple_relay), tor_exit_node: ctx.get(:tor), tor_local_process: ctx.get(:tor_process),
-        tor_local_socks: ctx.get(:tor_socks), wireguard: ctx.get(:wireguard), tailscale: ctx.get(:tailscale),
-        zerotier: ctx.get(:zerotier), score: ctx.get(:score)
-      },
-      dns: {
-        servers: active_dns, leak_detected: ctx.get(:dns_leak), dns_health_check: dns_health,
-        encrypted: ctx.get(:dns_encrypted), consistency: ctx.get(:dns_consistency)
+      version: app_version,
+      timestamp: Time.now.to_i,
+      metrics: {
+        ip: ctx_global[:ip],
+        country: geo_data['country_code'],
+        provider: vpn_st[:provider],
+        score: vpn_st[:confidence],
+        latency: perf ? (perf[:latency] || 0) : 0,
+        jitter: perf ? (perf[:jitter] || 0) : 0
       }
     })
-  else
-    icon = if ctx.get(:tor) || ctx.get(:tor_process) || ctx.get(:tor_socks)
-             "🧅" # Niveau d'anonymat maximal ou nœud Tor
-           elsif ctx.get(:vpn)
-             "🔐" # Tunnel VPN traditionnel sécurisé
-           elsif ctx.get(:apple_relay)
-             "🍏" # Apple Private Relay (J'utilise la pomme verte pour le côté "sécurisé/natif")
-           else
-             "🚨" # Trafic direct en clair / Risque
-           end
-    country_code = geo_info["country_code"]
-    flag_emoji = flag(country_code)
-    
-    menu_color = if DENY_COUNTRIES.include?(country_code)
-                   COLOR_ALERT
-                 elsif ctx.get(:vpn)
-                   COLOR_SECURE
-                 else
-                   "#ffff00"
-                 end
-
-    puts "#{icon} #{flag_emoji} | color=#{menu_color} dropdown=true"
-    puts "---"
-    puts "VPN Checker #{APP_VERSION} | font=Menlo size=12"
-    puts "---"
-    puts "IP Publique: #{ctx.get(:ip)}"
-    
-    if DENY_COUNTRIES.include?(country_code)
-      puts "🌍 Pays: #{country_code} #{flag_emoji} ⚠️ [NON CONFORME]"
-    elsif ALLOWED_COUNTRIES.include?(country_code)
-      puts "🌍 Pays: #{country_code} #{flag_emoji} ✅ [SÉCURISÉ]"
-    else
-      puts "🌍 Pays: #{country_code} #{flag_emoji}"
-    end
-
-    puts "Fournisseur: #{ctx.get(:isp)}"
-    puts "Infrastructure: #{ctx.get(:network_type)}"
-    puts "Connexion: #{ctx.get(:connection_type)}"
-    puts "---"
-
-    tunnels = []
-    tunnels << "🛡️ WireGuard" if vpn_ctx[:wireguard]
-    tunnels << "🛸 Tailscale" if vpn_ctx[:tailscale]
-    tunnels << "🪐 ZeroTier" if vpn_ctx[:zerotier]
-
-    if tunnels.empty?
-      puts "🌐 Tunnel (WireGuard, Tailscale, ZeroTier) : Aucun"
-      puts "🏢 Hébergement : #{geo_info['org']}" if datacenter_proxy
-    else
-      puts "🌐 Tunnels : #{tunnels.join(' + ')}"
-    end
-    puts "---"
-
-    vpn_label = ctx.get(:vpn) ? "Actif" : (ctx.get(:vpn_confidence) >= 70 ? "Suspecté" : "Inactif")
-
-    puts "Sécurité Réseau:"
-    puts "• Score Global: #{ctx.get(:score)}%"
-    puts "• Statut VPN: #{vpn_label} (Confiance: #{ctx.get(:vpn_confidence)}%)"
-    puts "• Fournisseur VPN détecté: #{ctx.get(:vpn_provider)}"
-    puts "🚨 Kill Switch FAIL" if killswitch
-    puts "• Fuite DNS (Leak): #{ctx.get(:dns_leak) ? '⚠️ OUI' : '🟢 Non'}"
-    puts "• DNS Chiffré: #{ctx.get(:dns_encrypted) ? '🟢 Oui' : 'Non'}"
-    puts "• Apple Private Relay: #{ctx.get(:apple_relay) ? '🍏 Actif' : 'Inactif'}"
-
-    iso_status = ctx.get(:dns_isolation) ? "safe" : "at risk"
-    puts "🛡️ DNS Isolation : #{iso_status}"
-    puts "🔄 Consistance : #{ctx.get(:dns_consistency)}"
-
-    tor_status = ctx.get(:tor) ? "🔴 Nœud de sortie actif" : ((ctx.get(:tor_process) || ctx.get(:tor_socks)) ? "🟡 Local actif" : "🟢 Inactif")
-    puts "🧅 Tor Network : #{tor_status}"
-    puts "---"
-
-    puts "DNS Servers Detected :"
-    all_dns_detected = [ctx.get(:dns_local), ctx.get(:dns_vpn), ctx.get(:dns_public)].compact.flatten.uniq
-
-    if all_dns_detected.empty?
-      puts "-- Aucun serveur détecté (Système par défaut)"
-    else
-      grouped_dns = Hash.new { |h, k| h[k] = [] }
-      all_dns_detected.each do |dns_ip|
-        label = if DNS_PROVIDERS.key?(dns_ip)
-                  DNS_PROVIDERS[dns_ip]
-                elsif IPGuard.private_ip?(dns_ip) || IPGuard.localhost?(dns_ip)
-                  ctx.get(:vpn) ? "🔐 VPN Private DNS" : "🏠 DNS Local / Routeur"
-                else
-                  "🌐 DNS Public Alternatif"
-                end
-        grouped_dns[label] << dns_ip
-      end
-      grouped_dns.each { |label, ips| puts "-- #{label} (#{ips.uniq.join(', ')})" }
-    end
-
-    if fp_changed
-      puts "---"
-      puts "⚠️ Infrastructure modifiée"
-    end
-
-    if rotation
-      puts "---"
-      puts "🔄 Rotation VPN détectée"
-      puts "-- #{rotation[:old_country]} → #{rotation[:new_country]}"
-      puts "-- AS#{rotation[:old_asn]} → AS#{rotation[:new_asn]}"
-    end
-
-    puts "---"
-    puts "Performances réseau:"
-    puts "• Latence standard: #{ctx.get(:latency)} ms • Jitter: #{ctx.get(:jitter)} ms"
-    puts "---"
-    puts "Empreinte Réseau (Fingerprint): #{ctx.get(:fingerprint)} | color=#888888"
+    exit 0
   end
+
+  # Construction des variables d'affichage
+  title_flag = flag(geo_data['country_code'])
+  is_secure  = vpn_st[:confidence] >= 85 && !d_health[:leak]
+  color      = is_secure ? color_secure : (vpn_st[:confidence] >= 55 ? color_warn : color_alert)
+
+  title_main = vpn_active ? "🔐 #{title_flag}" : "🏠 #{title_flag}"
+  
+  # 1. Barre supérieure MacOS Xbar
+  puts "#{title_main} | color=#{color} dropdown=true"
+  puts "---"
+  puts "VPN Checker #{app_version} | font=Menlo"
+  puts "---"
+  
+  # 2. Section Identité Réseau & Géolocalisation
+  puts "IP Publique: #{ctx_global[:ip] || 'Inconnue'}"
+  puts "🌍 Pays: #{geo_data['country_code']} #{title_flag} #{is_secure ? '✅ [SÉCURISÉ]' : '⚠️ [NON SÉCURISÉ]'}"
+  puts "Fournisseur: #{geo_data['org']} • Infrastructure: #{vpn_st[:infrastructure].to_s.upcase}"
+
+  # Identification dynamique du Tunnel
+  tunnels = {
+    "WireGuard" => vpn_st[:wireguard],
+    "OpenVPN"   => vpn_st[:openvpn],
+    "Tailscale" => vpn_st[:tailscale],
+    "ZeroTier"  => vpn_st[:zerotier]
+  }
+  tunnel_label = tunnels.find { |_, active| active }&.first || "Aucun"
+  
+  conn_type = ctx_global[:connection_type] || "standard"
+  puts "Connexion: #{conn_type} • 🌐 Tunnel : #{tunnel_label}"
+  puts "🏢 Hébergement : #{geo_data['org'].to_s.upcase}" if vpn_st[:infrastructure] == :hosting
+  puts "---"
+  
+  # 3. Section Sécurité Réseau & Heuristiques
+  puts "Sécurité Réseau:"
+  vpn_status = vpn_active ? "Actif (Confiance: #{vpn_st[:confidence]}%)" : "Inactif"
+  puts "• Score Global: #{vpn_st[:confidence]}%"
+  puts "• Statut VPN: #{vpn_status}"
+  puts "• Split Tunneling: #{NetworkAnalyzer.split_tunneling? ? '⚠️ Oui (Altéré)' : '🟢 Non (Global)'}"
+  puts "• Proxy Direct: #{ProxyDetector.instance.detected? ? '⚠️ Actif' : '🟢 Aucun'}"
+  puts "• Fournisseur VPN détecté: #{vpn_st[:provider]}" if vpn_active
+
+  # Statut du Kill Switch basé sur les tunnels orphelins
+  ks_broken = vpn_st[:heuristics][:orphan_leak]
+  puts ks_broken ? "🚨 Kill Switch FAIL" : "• Kill Switch: ✓ Actif"
+
+  dns_enc_label = DNSAnalyzer.detect_encryption_type(dns_split, DNSAnalyzer.doh_detect)
+  puts "• Fuite DNS (Leak): #{d_health[:leak] ? '⚠️ Oui' : '🟢 Non'} • Fuite DNS IPv6: #{d_health[:ipv6_leak] ? '🚨 Détectée' : '🟢 Aucune'}"
+  puts "• DNS Chiffré: #{dns_enc_label.include?('Non chiffré') ? '❌ Non' : '🟢 Oui'} • 🛡️ DNS Isolation : #{d_health[:isolation] ? 'safe' : 'unsafe'}"
+  
+  apple_relay = ctx_global[:apple_relay] ? "Actif" : "Inactif"
+  puts "• Apple Private Relay: #{apple_relay}"
+
+  # Consistance DNS
+  consistency = DNSAnalyzer.consistency(vpn_active, dns_split[:local], dns_split[:vpn], dns_split[:public])
+  consistency_map = {
+    "🟢 Cohérent (Réseau Standard)" => "🟢 Cohérent",
+    "🔐 Sécurisé (Tunnel DNS Exclusif)" => "🟢 Sécurisé",
+    "🟡 Mixte (Tunnel + Résolveurs Publics)" => "🟡 Mixte",
+    "⚠️ Danger (Fuite DNS probable)" => "🚨 Danger"
+  }
+  puts "🔄 Consistance : #{consistency_map[consistency] || consistency}"
+  
+  tor_status = ctx_global[:tor] ? "🟡 Actif" : "🟢 Inactif"
+  puts "🧅 Tor Network : #{tor_status}"
+  puts "---"
+  
+  # 4. Section Serveurs DNS
+  puts "DNS Servers Detected :"
+  all_dns = raw_dns || []
+  if all_dns.empty?
+    puts "-- Aucun serveur détecté (Système par défaut)"
+  else
+    grouped = Hash.new { |h, k| h[k] = [] }
+    all_dns.uniq.each do |ip|
+      label = if dns_providers.key?(ip)
+                dns_providers[ip]
+              elsif IPGuard.private_ip?(ip) || IPGuard.localhost?(ip)
+                vpn_active ? "🔐 VPN Private DNS" : "🏠 DNS Local / Routeur"
+              else
+                "🌐 DNS Public Alternatif"
+              end
+      grouped[label] << ip
+    end
+    grouped.each { |label, ips| puts "-- #{label} (#{ips.uniq.join(', ')})" }
+  end
+  puts "---"
+  
+  # 5. Section Métriques de Performance (Résolue, Dynamique avec Fallback propre)
+  puts "Performances réseau:"
+  puts "• Latence standard: #{display_latency} • Jitter: #{display_jitter}"
+  puts "---"
+  
+  # 6. Empreinte Unique du Diagnostic
+  fp = Digest::SHA256.hexdigest("#{ctx_global[:ip]}_#{geo_data['asn']}")[0..11]
+  puts "Empreinte Réseau (Fingerprint): #{fp} | color=#888888"
 end
 
-main if __FILE__ == $PROGRAM_NAME
+render_xbar
