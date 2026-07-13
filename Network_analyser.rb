@@ -1,6 +1,10 @@
 #!/usr/bin/env ruby
 # frozen_string_literal: true
 # script pour macOS (Catalina... Sequoia) avec ruby 2.6 dans l'application xbar.app
+# debug : cd ~/Library/Application\ Support/xbar/plugins/
+# debug : ruby VPN-flag316.txt --debug
+# debug : ruby -cw VPN-flag316.txt
+# rm -rf "$(ruby -e "require 'tmpdir'; print File.join(Dir.tmpdir, 'xbar_vpn_check2')")"
 
 require 'digest'
 require 'ipaddr'
@@ -24,7 +28,7 @@ require 'time'
 # ==============================================================================
 CONFIG_DATA = <<~YAML
   app_version: "v3.1.6"
-  thread_timeout: 1.0
+  thread_timeout: 3.0
   debug_errors: true
   allowed_countries: ["NL", "CH", "PL", "RO", "US"]
   deny_countries: ["FR"]
@@ -591,22 +595,27 @@ class IPFetcher
 
       result = []
       success_count = 0
-      begin
-        timeout_val = AppConfig.instance.get(:thread_timeout) || 1.0
-        Timeout.timeout(timeout_val) do
-          while (entry = queue.pop(true) rescue nil)
+      deadline = Time.now + (AppConfig.instance.get(:thread_timeout) || 3.0)
+
+      until Time.now >= deadline
+        begin
+          while (entry = queue.pop(true))
             result << entry
             result.uniq! { |e| e[:ip] }
             success_count += 1
           end
+        rescue ThreadError
         end
-      rescue Timeout::Error
-        StructuredLogger.instance.warn("Timeout expired for fetch_ip (#{success_count}/#{urls.size} succeeded)")
-      ensure
-        threads.each { |th| th.kill rescue nil }
-        threads.each { |th| th.join rescue nil }
+
+        break if result.any?
+
+        sleep 0.05
       end
 
+threads.each do |t|
+  t.join(0.2)
+rescue
+end
       ipv4 = result.find { |e| e[:version] == :v4 }&.dig(:ip)
       final_ip = ipv4 || result.first&.dig(:ip) || last_known_good_ip
       store_last_known_good_ip(final_ip) if final_ip && IPGuard.valid_format?(final_ip)
@@ -1083,7 +1092,10 @@ module VPNDetector
       wireguard: vpn_active_confirmed && (procs.include?("wireguard") || procs.include?("wg-quick") || has_vpn_mtu || (ifconfig_out.include?("wg") && ifconfig_out.include?("POINTOPOINT"))),
       tailscale: vpn_active_confirmed && procs.include?("tailscaled"),
       zerotier: vpn_active_confirmed && procs.include?("zerotier-one"),
-      openvpn: ifconfig_out.include?("tun") || procs.include?("openvpn"),
+      openvpn: (
+        procs.include?("openvpn") &&
+        active_vpn_interfaces.any? { |i| i.start_with?("tun") }
+      ),
       proton: proton_detected,
       confidence: confidence_score,
       provider: vpn_provider,
@@ -1362,18 +1374,39 @@ def render_xbar
   puts "---"
   
   # 2. Section Identité Réseau & Géolocalisation
-  puts "IP Publique: #{ctx_global[:ip] || 'Inconnue'}"
+  public_ip = ctx_global[:ip]
+
+  if public_ip.nil?
+    public_ip = IPFetcher.instance.last_known_good_ip
+  end
+
+puts "IP Publique: #{public_ip || 'Inconnue'}"
   puts "🌍 Pays: #{geo_data['country_code']} #{title_flag} #{is_secure ? '✅ [SÉCURISÉ]' : '⚠️ [NON SÉCURISÉ]'}"
   puts "Fournisseur: #{geo_data['org']} • Infrastructure: #{vpn_st[:infrastructure].to_s.upcase}"
 
   # Identification dynamique du Tunnel
+
   tunnels = {
     "WireGuard" => vpn_st[:wireguard],
     "OpenVPN"   => vpn_st[:openvpn],
     "Tailscale" => vpn_st[:tailscale],
     "ZeroTier"  => vpn_st[:zerotier]
   }
-  tunnel_label = tunnels.find { |_, active| active }&.first || "Aucun"
+  tunnel_label =
+  case
+  when vpn_st[:wireguard]
+    "WireGuard"
+  when vpn_st[:openvpn]
+    "OpenVPN"
+  when vpn_st[:tailscale]
+    "Tailscale"
+  when vpn_st[:zerotier]
+    "ZeroTier"
+  when vpn_st[:active]
+    "Tunnel VPN"
+  else
+    "Aucun"
+  end
   
   conn_type = ctx_global[:connection_type] || "standard"
   puts "Connexion: #{conn_type} • 🌐 Tunnel : #{tunnel_label}"
