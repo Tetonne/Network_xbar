@@ -391,20 +391,31 @@ module VPNChecker
   module Infrastructure
     class CommandExecutor
       def self.run(*cmd_args, timeout: Config::TIMEOUT_SLOW)
-        stdout_str, stderr_str, status = nil, nil, nil
-
-        Timeout.timeout(timeout) do
-          stdout_str, stderr_str, status = Open3.capture3(*cmd_args)
+        stdout_str, stderr_str, status = '', '', nil
+        
+        # Utilisation de popen3 à la place de capture3 pour un meilleur contrôle des flux sous Ruby 2.6
+        Open3.popen3(*cmd_args) do |stdin, stdout, stderr, wait_thr|
+          stdin.close
+          begin
+            Timeout.timeout(timeout) do
+              stdout_str = stdout.read
+              stderr_str = stderr.read
+              status = wait_thr.value
+            end
+          rescue Timeout::Error
+            # Tuer le processus s'il dépasse le timeout
+            Process.kill('TERM', wait_thr.pid) rescue nil
+            wait_thr.join(0.2)
+            Logger.log_timeout("CommandExecutor", "Commande: #{cmd_args.join(' ')} (#{timeout}s)")
+            return { stdout: '', stderr: 'Timeout', success: false }
+          end
         end
 
         {
-          stdout: stdout_str || '',
-          stderr: stderr_str || '',
+          stdout: stdout_str,
+          stderr: stderr_str,
           success: status&.success? || false
         }
-      rescue Timeout::Error => e
-        Logger.log_timeout("CommandExecutor", "Commande: #{cmd_args.join(' ')} (#{timeout}s)")
-        { stdout: '', stderr: e.message, success: false }
       rescue StandardError => e
         Logger.error("Erreur d'exécution système : #{e.message}")
         { stdout: '', stderr: e.message, success: false }
@@ -1732,11 +1743,11 @@ module VPNChecker
         puts "VPN Checker v#{APP_VERSION} | font=Menlo"
         puts "---"
 
-        puts "🌐 IDENTITÉ RÉSEAU"
+        puts "🌐 IDENTITÉ RÉSEAU (#{ip_v4})"
         rdns_info = VPNChecker::Helpers.reverse_dns_status(context[:ptr], org, ip_v4, vpn_active: vpn[:active])
 
         if rdns_info[:alert] && context[:ptr]
-          puts "IP Publique: #{ip_v4} (#{sanitize_xbar(context[:ptr])}) (#{sanitize_xbar(org)}) 🚨[PTR Incohérent]"
+          puts "PTR Alerte: (#{sanitize_xbar(context[:ptr])}) (#{sanitize_xbar(org)}) 🚨[PTR Incohérent]"
         end
 
         puts "Infrastructure: ☁️ #{provider[:type] == Enums::InfrastructureType[:HOSTING] ? 'Cloud / VPN' : 'Résidentiel'} (#{sanitize_xbar(geo[:asn])})"
